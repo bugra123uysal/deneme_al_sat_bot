@@ -1,0 +1,786 @@
+"""
+ABD Borsası Al/Sat Botu — UT Bot Alerts + Simülasyon
+=====================================================
+Tek dosyalık birleşik uygulama:
+  1) 📡 Piyasa Tarayıcı : Tüm hisse havuzunu tarar, AL/SAT sinyali verenleri
+                          en üstte liste halinde gösterir.
+  2) 🤖 Detaylı Analiz  : Seçilen hisse için UT Bot grafiği + backtest +
+                          teknik skor/formasyon analizi.
+  3) 🎮 Simülasyon      : Eğitim amaçlı trading karar oyunu (XP, rozet, hedef).
+
+İndikatör mantığı: TradingView "UT Bot Alerts" (ATR trailing stop) birebir uyarlama.
+
+UYARI: Yatırım tavsiyesi değildir. Gerçek emir göndermez. Eğitim amaçlıdır.
+"""
+
+import streamlit as st
+import yfinance as yf
+import pandas as pd
+import numpy as np
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots 
+import random 
+from datetime import datetime
+
+# ===========================================================================
+# SABİTLER
+# ===========================================================================
+
+DEFAULT_TICKERS = [
+    "AAPL", "MSFT", "NVDA", "TSLA", "AMD", "META", "AMZN", "GOOGL",
+    "PLTR", "COIN", "NFLX", "AVGO", "SMCI", "MU", "INTC", "JPM",
+    "V", "WMT", "DIS", "BA",
+]
+
+PERIOD_INTERVAL_MAP = {
+    "5 Gün / 15dk": ("5d", "15m"),
+    "1 Ay / 1saat": ("1mo", "1h"),
+    "3 Ay / Günlük": ("3mo", "1d"),
+    "6 Ay / Günlük": ("6mo", "1d"),
+    "1 Yıl / Günlük": ("1y", "1d"),
+}
+
+GOALS = [110, 120, 130, 140, 150, 170, 190, 210, 250, 300, 350, 400, 450, 500]
+
+BADGES = {
+    "İlk Doğru Karar": {"icon": "🎯", "cond": lambda s: s["correct"] >= 1},
+    "İlk Kâr":         {"icon": "💰", "cond": lambda s: s["balance"] > 100},
+    "3 Doğru Seri":    {"icon": "🔥", "cond": lambda s: s["streak"] >= 3},
+    "Riskten Kaçan":   {"icon": "🛡️", "cond": lambda s: s["risk_avoided"] >= 1},
+    "Trend Avcısı":    {"icon": "📈", "cond": lambda s: s["correct"] >= 5},
+    "Formasyon Ustası":{"icon": "🔍", "cond": lambda s: s["correct"] >= 10},
+    "Hedef Avcısı":    {"icon": "🏹", "cond": lambda s: s["goals_done"] >= 1},
+    "2x Bakiye":       {"icon": "🚀", "cond": lambda s: s["balance"] >= 200},
+}
+
+SYNTHETIC_TYPES = ["Yükselen Trend", "Düşen Trend", "Yatay Piyasa", "Breakout",
+                   "Fake Breakout", "Pullback", "Hacimli Yükseliş", "RSI Zayıflığı"]
+
+# Renkler
+C_UP = "#16c784"
+C_DOWN = "#ea3943"
+C_ACCENT = "#3b82f6"
+C_PURPLE = "#a855f7"
+C_GOLD = "#f0b90b"
+
+# ===========================================================================
+# TEKNİK HESAPLAMALAR
+# ===========================================================================
+
+def compute_ema(series: pd.Series, span: int) -> pd.Series:
+    return series.ewm(span=span, adjust=False).mean()
+
+
+def compute_rsi(series: pd.Series, period: int = 14) -> pd.Series:
+    delta = series.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.ewm(com=period - 1, min_periods=period).mean()
+    avg_loss = loss.ewm(com=period - 1, min_periods=period).mean()
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    return 100 - (100 / (1 + rs))
+
+
+def wilder_atr(df: pd.DataFrame, period: int) -> pd.Series:
+    """TradingView atr() ile uyumlu Wilder (RMA) ATR."""
+    high, low, close = df["High"], df["Low"], df["Close"]
+    prev_close = close.shift(1)
+    tr = pd.concat([
+        high - low,
+        (high - prev_close).abs(),
+        (low - prev_close).abs(),
+    ], axis=1).max(axis=1)
+    return tr.ewm(alpha=1 / period, adjust=False).mean()
+
+
+def ut_bot_signals(df: pd.DataFrame, key_value: float = 1.0, atr_period: int = 10) -> pd.DataFrame:
+    """UT Bot Alerts mantığı: ATR trailing stop + AL/SAT sinyalleri."""
+    src = df["Close"].values
+    atr = wilder_atr(df, atr_period).values
+    n_loss = key_value * atr
+    n = len(src)
+    stop = np.zeros(n)
+
+    for i in range(n):
+        if i == 0 or np.isnan(atr[i]):
+            stop[i] = src[i] - n_loss[i] if not np.isnan(n_loss[i]) else src[i]
+            continue
+        prev = stop[i - 1]
+        if src[i] > prev and src[i - 1] > prev:
+            stop[i] = max(prev, src[i] - n_loss[i])
+        elif src[i] < prev and src[i - 1] < prev:
+            stop[i] = min(prev, src[i] + n_loss[i])
+        elif src[i] > prev:
+            stop[i] = src[i] - n_loss[i]
+        else:
+            stop[i] = src[i] + n_loss[i]
+
+    pos = np.zeros(n)
+    for i in range(1, n):
+        if src[i - 1] < stop[i - 1] and src[i] > stop[i - 1]:
+            pos[i] = 1
+        elif src[i - 1] > stop[i - 1] and src[i] < stop[i - 1]:
+            pos[i] = -1
+        else:
+            pos[i] = pos[i - 1]
+
+    ema = src  # EMA(src, 1) == src
+    above = np.zeros(n, dtype=bool)
+    below = np.zeros(n, dtype=bool)
+    for i in range(1, n):
+        above[i] = ema[i - 1] <= stop[i - 1] and ema[i] > stop[i]
+        below[i] = stop[i - 1] <= ema[i - 1] and stop[i] > ema[i]
+
+    out = df.copy()
+    out["stop"] = stop
+    out["atr"] = atr
+    out["pos"] = pos
+    out["buy"] = (src > stop) & above
+    out["sell"] = (src < stop) & below
+    return out
+
+
+def detect_formation(df: pd.DataFrame) -> list:
+    formations = []
+    close, volume = df["Close"], df["Volume"]
+    ema21, ema50 = compute_ema(close, 21), compute_ema(close, 50)
+    rsi = compute_rsi(close)
+    last_close = close.iloc[-1]
+    last_rsi = rsi.iloc[-1] if not pd.isna(rsi.iloc[-1]) else 50
+    avg_vol = volume.iloc[-20:].mean()
+
+    a21 = last_close > ema21.iloc[-1]
+    a50 = last_close > ema50.iloc[-1]
+    cross = ema21.iloc[-1] > ema50.iloc[-1]
+
+    if a21 and a50 and cross:
+        formations.append("Yükselen Trend")
+    elif not a21 and not a50 and not cross:
+        formations.append("Düşen Trend")
+    else:
+        formations.append("Yatay Piyasa")
+
+    if last_close > df["High"].iloc[-21:-1].max():
+        formations.append("Direnç Kırılımı")
+    if last_close < df["Low"].iloc[-21:-1].min():
+        formations.append("Destek Kırılımı")
+    if volume.iloc[-1] > avg_vol * 1.5:
+        formations.append("Hacimli Kırılım")
+    if ema21.iloc[-2] < ema50.iloc[-2] and ema21.iloc[-1] > ema50.iloc[-1]:
+        formations.append("EMA Altın Kesişim")
+    if ema21.iloc[-2] > ema50.iloc[-2] and ema21.iloc[-1] < ema50.iloc[-1]:
+        formations.append("EMA Ölüm Kesişimi")
+    if df["Low"].iloc[-10:].is_monotonic_increasing:
+        formations.append("Higher Low")
+    if df["High"].iloc[-10:].is_monotonic_decreasing:
+        formations.append("Lower High")
+    return formations
+
+
+def compute_score(df: pd.DataFrame) -> dict:
+    close, volume = df["Close"], df["Volume"]
+    ema21, ema50 = compute_ema(close, 21), compute_ema(close, 50)
+    rsi = compute_rsi(close)
+    last_close = close.iloc[-1]
+    last_rsi = rsi.iloc[-1] if not pd.isna(rsi.iloc[-1]) else 50
+    avg_vol = volume.iloc[-20:].mean()
+
+    trend = 25 if (last_close > ema21.iloc[-1] and last_close > ema50.iloc[-1]) else (12 if last_close > ema21.iloc[-1] else 0)
+    ema = 20 if ema21.iloc[-1] > ema50.iloc[-1] else 0
+    rsi_s = 15 if last_rsi > 55 else (7 if last_rsi > 45 else 0)
+    vol = 20 if volume.iloc[-1] > avg_vol else 0
+    formations = detect_formation(df)
+    form = min(20, len([f for f in formations if f not in ("Yatay Piyasa", "Düşen Trend", "Lower High", "EMA Ölüm Kesişimi", "Destek Kırılımı")]) * 7)
+    total = trend + ema + rsi_s + vol + form
+    return {"total": total, "trend": trend, "ema": ema, "rsi": rsi_s,
+            "volume": vol, "formation": form, "formations": formations,
+            "rsi_val": round(last_rsi, 1)}
+
+
+def system_decision(score: int) -> str:
+    if score >= 70:
+        return "AL için uygun"
+    elif score >= 40:
+        return "Bekle / izlemeye değer"
+    return "İşleme girmek riskli"
+
+
+# ===========================================================================
+# VERİ ÇEKME (cache'li)
+# ===========================================================================
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_data(ticker: str, period: str, interval: str) -> pd.DataFrame | None:
+    try:
+        df = yf.download(ticker, period=period, interval=interval,
+                         progress=False, auto_adjust=True)
+        if df is None or len(df) < 30:
+            return None
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        return df.dropna()
+    except Exception:
+        return None
+
+
+# ===========================================================================
+# BACKTEST
+# ===========================================================================
+
+def backtest(df: pd.DataFrame, initial_cash: float = 10000.0, fee_pct: float = 0.1) -> dict:
+    cash, position, entry_price = initial_cash, 0.0, 0.0
+    trades, equity_curve = [], []
+    fee = fee_pct / 100.0
+    closes = df["Close"].values
+    buys, sells = df["buy"].values, df["sell"].values
+    idx = df.index
+
+    for i in range(len(df)):
+        price = closes[i]
+        if buys[i] and position == 0:
+            qty = (cash * (1 - fee)) / price
+            position, entry_price, cash = qty, price, 0.0
+            trades.append({"Tarih": idx[i], "Tip": "AL", "Fiyat": round(price, 2),
+                           "Adet": round(qty, 4), "P&L %": None})
+        elif sells[i] and position > 0:
+            cash = position * price * (1 - fee)
+            pnl = (price - entry_price) / entry_price * 100
+            trades.append({"Tarih": idx[i], "Tip": "SAT", "Fiyat": round(price, 2),
+                           "Adet": round(position, 4), "P&L %": round(pnl, 2)})
+            position = 0.0
+        equity_curve.append(cash + position * price)
+
+    final = cash + position * closes[-1]
+    total_ret = (final - initial_cash) / initial_cash * 100
+    closed = [t for t in trades if t["Tip"] == "SAT"]
+    wins = [t for t in closed if t["P&L %"] and t["P&L %"] > 0]
+    win_rate = len(wins) / len(closed) * 100 if closed else 0
+    bh_ret = (closes[-1] - closes[0]) / closes[0] * 100
+    eq = np.array(equity_curve)
+    dd = (eq - np.maximum.accumulate(eq)) / np.maximum.accumulate(eq) * 100
+    return {"final_equity": final, "total_return": total_ret, "bh_return": bh_ret,
+            "n_trades": len(closed), "win_rate": win_rate,
+            "max_dd": dd.min() if len(dd) else 0, "trades": trades,
+            "equity_curve": equity_curve, "open_position": position > 0}
+
+
+# ===========================================================================
+# PİYASA TARAYICI
+# ===========================================================================
+
+def scan_market(tickers: list, period: str, interval: str,
+                key_value: float, atr_period: int, lookback: int) -> pd.DataFrame:
+    """Her hisse için son `lookback` mumda sinyal var mı kontrol eder."""
+    rows = []
+    progress = st.progress(0.0, text="Hisseler taranıyor...")
+    for i, t in enumerate(tickers):
+        progress.progress((i + 1) / len(tickers), text=f"Taranıyor: {t}")
+        df = fetch_data(t, period, interval)
+        if df is None or len(df) < atr_period + 5:
+            continue
+        sig = ut_bot_signals(df, key_value, atr_period)
+        recent = sig.iloc[-lookback:]
+        last = sig.iloc[-1]
+
+        signal = "—"
+        bars_ago = None
+        if recent["buy"].any():
+            signal = "AL"
+            bars_ago = lookback - 1 - int(np.where(recent["buy"].values)[0][-1])
+        if recent["sell"].any():
+            sell_idx = lookback - 1 - int(np.where(recent["sell"].values)[0][-1])
+            if signal == "—" or sell_idx < bars_ago:
+                signal = "SAT"
+                bars_ago = sell_idx
+
+        score = compute_score(df)
+        chg = (df["Close"].iloc[-1] - df["Close"].iloc[-2]) / df["Close"].iloc[-2] * 100
+        rows.append({
+            "Hisse": t,
+            "Sinyal": signal,
+            "Kaç Mum Önce": bars_ago if bars_ago is not None else "—",
+            "Fiyat": round(float(df["Close"].iloc[-1]), 2),
+            "Günlük %": round(float(chg), 2),
+            "Pozisyon": "LONG" if last["pos"] == 1 else "NAKİT",
+            "Skor": score["total"],
+            "RSI": score["rsi_val"],
+            "Sistem": system_decision(score["total"]),
+        })
+    progress.empty()
+    return pd.DataFrame(rows)
+
+
+# ===========================================================================
+# GRAFİKLER
+# ===========================================================================
+
+def make_ut_chart(df: pd.DataFrame, title: str) -> go.Figure:
+    ema21 = compute_ema(df["Close"], 21)
+    ema50 = compute_ema(df["Close"], 50)
+    rsi = compute_rsi(df["Close"])
+
+    fig = make_subplots(rows=3, cols=1, shared_xaxes=True,
+                        row_heights=[0.6, 0.18, 0.22], vertical_spacing=0.03,
+                        subplot_titles=("Fiyat & UT Bot", "Hacim", "RSI"))
+
+    fig.add_trace(go.Candlestick(x=df.index, open=df["Open"], high=df["High"],
+                  low=df["Low"], close=df["Close"], name="Fiyat",
+                  increasing_line_color=C_UP, decreasing_line_color=C_DOWN,
+                  increasing_fillcolor=C_UP, decreasing_fillcolor=C_DOWN), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df.index, y=df["stop"], name="UT Stop",
+                  line=dict(color=C_PURPLE, width=1.5)), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df.index, y=ema21, name="EMA21",
+                  line=dict(color=C_GOLD, width=1)), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df.index, y=ema50, name="EMA50",
+                  line=dict(color=C_ACCENT, width=1)), row=1, col=1)
+
+    buys, sells = df[df["buy"]], df[df["sell"]]
+    fig.add_trace(go.Scatter(x=buys.index, y=buys["Low"] * 0.985, mode="markers",
+                  name="AL", marker=dict(symbol="triangle-up", size=14, color=C_UP,
+                  line=dict(color="white", width=1))), row=1, col=1)
+    fig.add_trace(go.Scatter(x=sells.index, y=sells["High"] * 1.015, mode="markers",
+                  name="SAT", marker=dict(symbol="triangle-down", size=14, color=C_DOWN,
+                  line=dict(color="white", width=1))), row=1, col=1)
+
+    colors = [C_UP if c >= o else C_DOWN for c, o in zip(df["Close"], df["Open"])]
+    fig.add_trace(go.Bar(x=df.index, y=df["Volume"], name="Hacim",
+                  marker_color=colors, opacity=0.6), row=2, col=1)
+
+    fig.add_trace(go.Scatter(x=df.index, y=rsi, name="RSI",
+                  line=dict(color="#ff7043", width=1.4)), row=3, col=1)
+    fig.add_hline(y=70, line=dict(color="rgba(234,57,67,0.5)", dash="dash"), row=3, col=1)
+    fig.add_hline(y=30, line=dict(color="rgba(22,199,132,0.5)", dash="dash"), row=3, col=1)
+
+    fig.update_layout(title=title, template="plotly_dark",
+                      paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(13,17,28,1)",
+                      height=640, xaxis_rangeslider_visible=False,
+                      legend=dict(orientation="h", y=1.02, x=1, xanchor="right"),
+                      margin=dict(l=10, r=10, t=50, b=10))
+    fig.update_yaxes(gridcolor="rgba(255,255,255,0.05)")
+    fig.update_xaxes(gridcolor="rgba(255,255,255,0.05)")
+    return fig
+
+
+def make_equity_chart(equity_curve, index) -> go.Figure:
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=index, y=equity_curve, fill="tozeroy",
+                  line=dict(color=C_ACCENT, width=2), name="Portföy"))
+    fig.update_layout(title="Portföy Değeri (Equity Curve)", template="plotly_dark",
+                      paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(13,17,28,1)",
+                      height=260, margin=dict(l=10, r=10, t=40, b=10))
+    return fig
+
+
+# ===========================================================================
+# SİMÜLASYON OYUNU (app.py'den uyarlandı)
+# ===========================================================================
+
+def generate_synthetic_data(scenario_type: str = "Yükselen Trend", n: int = 120) -> pd.DataFrame:
+    np.random.seed(random.randint(0, 9999))
+    price = 100.0
+    prices, volumes = [], []
+    drift = {"Yükselen Trend": 0.003, "Düşen Trend": -0.003, "Yatay Piyasa": 0.0,
+             "Breakout": 0.001, "Fake Breakout": 0.002, "Pullback": 0.002,
+             "Hacimli Yükseliş": 0.004, "RSI Zayıflığı": -0.001}.get(scenario_type, 0.001)
+    for i in range(n):
+        if scenario_type == "Breakout" and i == int(n * 0.7):
+            drift = 0.01
+        if scenario_type == "Fake Breakout" and i == int(n * 0.7):
+            drift = 0.008
+        if scenario_type == "Fake Breakout" and i == int(n * 0.8):
+            drift = -0.01
+        price = max(price * (1 + drift + np.random.normal(0, 0.015)), 1)
+        prices.append(price)
+        volumes.append(int((2_500_000 if scenario_type == "Hacimli Yükseliş" else 1_000_000) * random.uniform(0.5, 2.0)))
+    closes = np.array(prices)
+    opens = np.roll(closes, 1); opens[0] = closes[0]
+    highs = closes * (1 + np.abs(np.random.normal(0, 0.005, n)))
+    lows = closes * (1 - np.abs(np.random.normal(0, 0.005, n)))
+    idx = pd.date_range(end=datetime.today(), periods=n, freq="D")
+    return pd.DataFrame({"Open": opens, "High": highs, "Low": lows,
+                         "Close": closes, "Volume": volumes}, index=idx)
+
+
+def init_sim_state():
+    defaults = {"balance": 100.0, "xp": 0, "correct": 0, "wrong": 0, "streak": 0,
+                "risk_avoided": 0, "goals_done": 0, "badges": [], "history": [],
+                "balance_history": [100.0], "scenario": None, "phase": "idle",
+                "decision": None, "goals_reached": []}
+    for k, v in defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
+
+
+def xp_to_level(xp: int) -> int:
+    return 1 + xp // 100
+
+
+# ===========================================================================
+# SAYFALAR
+# ===========================================================================
+
+def page_scanner(tickers, period, interval, key_value, atr_period):
+    st.subheader("📡 Piyasa Tarayıcı")
+    st.caption("Tüm hisse havuzu UT Bot mantığıyla taranır. AL/SAT sinyali verenler en üstte gruplanır.")
+
+    lookback = st.slider("Sinyal Tazeliği (son kaç mumda sinyal aransın)", 1, 10, 3,
+                         help="1 = sadece en son mumda sinyal verenler")
+    if st.button("🔍 Piyasayı Tara", type="primary", use_container_width=True):
+        df = scan_market(tickers, period, interval, key_value, atr_period, lookback)
+        st.session_state["scan_result"] = df
+
+    df = st.session_state.get("scan_result")
+    if df is None or df.empty:
+        st.info("👆 'Piyasayı Tara' butonuna basın.")
+        return
+
+    buy_list = df[df["Sinyal"] == "AL"].sort_values("Kaç Mum Önce")
+    sell_list = df[df["Sinyal"] == "SAT"].sort_values("Kaç Mum Önce")
+
+    col1, col2 = st.columns(2)
+    with col1:
+        st.markdown(f"### 🟢 AL Sinyali ({len(buy_list)})")
+        if buy_list.empty:
+            st.caption("Sinyal yok.")
+        else:
+            for _, r in buy_list.iterrows():
+                st.markdown(
+                    f'<div style="background:rgba(22,199,132,0.12);border-left:4px solid {C_UP};'
+                    f'border-radius:8px;padding:10px 14px;margin-bottom:8px;">'
+                    f'<b style="font-size:1.1rem;">{r["Hisse"]}</b> &nbsp; ${r["Fiyat"]} '
+                    f'<span style="color:{C_UP if r["Günlük %"]>=0 else C_DOWN};">({r["Günlük %"]:+}%)</span><br>'
+                    f'<span style="color:#aaa;font-size:0.8rem;">{r["Kaç Mum Önce"]} mum önce • Skor {r["Skor"]}/100 • RSI {r["RSI"]}</span>'
+                    f'</div>', unsafe_allow_html=True)
+    with col2:
+        st.markdown(f"### 🔴 SAT Sinyali ({len(sell_list)})")
+        if sell_list.empty:
+            st.caption("Sinyal yok.")
+        else:
+            for _, r in sell_list.iterrows():
+                st.markdown(
+                    f'<div style="background:rgba(234,57,67,0.12);border-left:4px solid {C_DOWN};'
+                    f'border-radius:8px;padding:10px 14px;margin-bottom:8px;">'
+                    f'<b style="font-size:1.1rem;">{r["Hisse"]}</b> &nbsp; ${r["Fiyat"]} '
+                    f'<span style="color:{C_UP if r["Günlük %"]>=0 else C_DOWN};">({r["Günlük %"]:+}%)</span><br>'
+                    f'<span style="color:#aaa;font-size:0.8rem;">{r["Kaç Mum Önce"]} mum önce • Skor {r["Skor"]}/100 • RSI {r["RSI"]}</span>'
+                    f'</div>', unsafe_allow_html=True)
+
+    st.divider()
+    st.markdown("#### 📊 Tüm Hisseler")
+    st.dataframe(
+        df.sort_values("Skor", ascending=False),
+        use_container_width=True, hide_index=True,
+        column_config={
+            "Günlük %": st.column_config.NumberColumn(format="%.2f%%"),
+            "Skor": st.column_config.ProgressColumn(min_value=0, max_value=100, format="%d"),
+        },
+    )
+
+
+def page_analysis(tickers, period, interval, key_value, atr_period, initial_cash, fee_pct):
+    st.subheader("🤖 Detaylı Hisse Analizi")
+    pool = tickers + (["BTC-USD", "ETH-USD"])
+    sel = st.selectbox("Hisse Seç", pool, index=0)
+    manual = st.text_input("veya manuel sembol gir (opsiyonel)", "")
+    ticker = manual.strip().upper() if manual.strip() else sel
+
+    df = fetch_data(ticker, period, interval)
+    if df is None or len(df) < atr_period + 5:
+        st.error(f"'{ticker}' için yeterli veri yok. Farklı sembol/periyot deneyin.")
+        return
+
+    df = ut_bot_signals(df, key_value, atr_period)
+    result = backtest(df, initial_cash, fee_pct)
+    score = compute_score(df)
+
+    # Güncel sinyal
+    last = df.iloc[-1]
+    if last["buy"]:
+        st.success(f"🟢 **GÜNCEL SİNYAL: AL** — {ticker} @ ${last['Close']:.2f}")
+    elif last["sell"]:
+        st.error(f"🔴 **GÜNCEL SİNYAL: SAT** — {ticker} @ ${last['Close']:.2f}")
+    else:
+        durum = "LONG (pozisyonda)" if last["pos"] == 1 else "NAKİT"
+        st.info(f"⚪ Yeni sinyal yok • Bot durumu: **{durum}** • Fiyat: ${last['Close']:.2f}")
+
+    # Metrikler
+    m = st.columns(5)
+    m[0].metric("Strateji Getirisi", f"{result['total_return']:+.2f}%")
+    m[1].metric("Al & Tut", f"{result['bh_return']:+.2f}%",
+                delta=f"{result['total_return']-result['bh_return']:+.2f}%")
+    m[2].metric("İşlem", result["n_trades"])
+    m[3].metric("Kazanma %", f"{result['win_rate']:.0f}%")
+    m[4].metric("Max DD", f"{result['max_dd']:.1f}%")
+
+    st.plotly_chart(make_ut_chart(df, f"{ticker} • UT Bot (key={key_value}, ATR={atr_period})"),
+                    use_container_width=True)
+
+    with st.expander("📊 Teknik Skor & Formasyonlar", expanded=False):
+        s = st.columns(5)
+        s[0].metric("Skor", f"{score['total']}/100")
+        s[1].metric("Trend", f"{score['trend']}/25")
+        s[2].metric("EMA", f"{score['ema']}/20")
+        s[3].metric("RSI", f"{score['rsi']}/15 ({score['rsi_val']})")
+        s[4].metric("Hacim", f"{score['volume']}/20")
+        st.info(f"🤖 Sistem Kararı: **{system_decision(score['total'])}**")
+        if score["formations"]:
+            st.markdown("**Formasyonlar:** " + " · ".join(score["formations"]))
+
+    st.plotly_chart(make_equity_chart(result["equity_curve"], df.index), use_container_width=True)
+
+    if result["trades"]:
+        st.markdown("#### 📋 İşlem Geçmişi")
+        st.dataframe(pd.DataFrame(result["trades"]), use_container_width=True, hide_index=True)
+    else:
+        st.warning("Bu ayarlarla işlem sinyali üretilmedi.")
+
+
+def page_simulation(tickers, period, interval):
+    init_sim_state()
+    st.subheader("🎮 Trading Simülasyon Oyunu")
+    st.caption("Grafiği analiz et, kararını ver, sonucu gör. $100 sanal bakiye ile başla.")
+
+    bal = st.session_state["balance"]
+    xp = st.session_state["xp"]
+    correct, wrong = st.session_state["correct"], st.session_state["wrong"]
+    total = correct + wrong
+    win_rate = f"{correct/total*100:.0f}%" if total else "—"
+    next_goal = next((g for g in GOALS if g > bal), None)
+
+    cols = st.columns(7)
+    for col, (lbl, val) in zip(cols, [
+        ("💰 Bakiye", f"${bal:.2f}"), ("⭐ XP", str(xp)), ("🏆 Sv", str(xp_to_level(xp))),
+        ("✅", str(correct)), ("❌", str(wrong)), ("📊 WR", win_rate),
+        ("🎯 Hedef", f"${next_goal}" if next_goal else "MAX")]):
+        col.markdown(f'<div class="mcard"><div class="mval">{val}</div><div class="mlbl">{lbl}</div></div>',
+                     unsafe_allow_html=True)
+
+    if next_goal:
+        prev = max([g for g in [100] + GOALS if g <= bal], default=100)
+        st.progress(max(0.0, min((bal - prev) / (next_goal - prev), 1.0)),
+                    text=f"Sonraki hedef ${next_goal} • Kalan ${next_goal-bal:.2f}")
+
+    if st.session_state["badges"]:
+        st.markdown("**Rozetler:** " + " ".join(
+            f'<span class="badge">{BADGES[b]["icon"]} {b}</span>' for b in st.session_state["badges"]),
+            unsafe_allow_html=True)
+
+    st.divider()
+    c1, c2 = st.columns(2)
+    if c1.button("📥 Yeni Senaryo (Gerçek Veri)", use_container_width=True):
+        random.shuffle(tickers)
+        chosen, df = None, None
+        for t in tickers:
+            df = fetch_data(t, period, interval)
+            if df is not None and len(df) > 60:
+                chosen = t
+                break
+        if df is None:
+            st.error("Veri alınamadı.")
+        else:
+            _setup_scenario(df, "Gizli Hisse")
+    if c2.button("🎲 Yeni Senaryo (Sentetik)", use_container_width=True):
+        stype = random.choice(SYNTHETIC_TYPES)
+        _setup_scenario(generate_synthetic_data(stype), f"Sentetik ({stype})")
+
+    sc = st.session_state.get("scenario")
+    if sc is None:
+        st.info("👆 Yeni senaryo getirin.")
+        return
+
+    phase = st.session_state["phase"]
+    if phase == "ready" and st.button("▶️ Grafiği Başlat", use_container_width=True):
+        st.session_state["phase"] = "showing"
+        st.rerun()
+
+    if phase in ("showing", "result"):
+        show_future = phase == "result"
+        st.plotly_chart(_sim_chart(sc["df_show"], sc["df_future"] if show_future else None,
+                                   sc["label"]), use_container_width=True)
+
+    if phase == "showing":
+        st.markdown("### 🎯 Kararını Ver")
+        d = st.columns(4)
+        decision = None
+        if d[0].button("🟢 AL", use_container_width=True): decision = "AL"
+        if d[1].button("🔴 SAT", use_container_width=True): decision = "SAT"
+        if d[2].button("🟡 BEKLE", use_container_width=True): decision = "BEKLE"
+        if d[3].button("⬜ GİRME", use_container_width=True): decision = "İŞLEME GİRME"
+        if decision:
+            _resolve_decision(decision, sc)
+            st.rerun()
+
+    if phase == "result" and "_eval" in sc:
+        ev = sc["_eval"]
+        if ev["correct"]:
+            st.success(f"✅ Doğru! P&L ${ev['pnl']:+.2f} • +{sc['_xp']} XP")
+        else:
+            st.error(f"❌ Yanlış. P&L ${ev['pnl']:+.2f} • +{sc['_xp']} XP")
+        if sc.get("_badges"):
+            st.balloons()
+            st.success("🏅 Yeni Rozet: " + ", ".join(sc["_badges"]))
+        dir_ = "yükseldi" if ev["pct_change"] > 0 else "düştü"
+        st.markdown(f"**Rapor:** Sonuç bölgesinde fiyat **%{abs(ev['pct_change']):.2f}** {dir_}. "
+                    f"Sistem skoru {sc['score']['total']}/100 ({system_decision(sc['score']['total'])}). "
+                    f"Formasyonlar: {', '.join(sc['score']['formations'])}.")
+        st.plotly_chart(_sim_balance_chart(), use_container_width=True)
+
+    if st.session_state["history"]:
+        with st.expander("📋 Karar Geçmişi"):
+            st.dataframe(pd.DataFrame(st.session_state["history"]),
+                         use_container_width=True, hide_index=True)
+
+
+def _setup_scenario(df, label):
+    n = len(df)
+    split = int(n * 0.67)
+    sc = {"df_show": df.iloc[:split].copy(), "df_future": df.iloc[split:].copy(),
+          "label": label, "score": compute_score(df.iloc[:split])}
+    st.session_state["scenario"] = sc
+    st.session_state["phase"] = "ready"
+    st.rerun()
+
+
+def _resolve_decision(decision, sc):
+    fut = sc["df_future"]
+    entry, exit_ = fut["Close"].iloc[0], fut["Close"].iloc[-1]
+    pct = (exit_ - entry) / entry * 100
+    score = sc["score"]["total"]
+    is_risky = score < 40
+    correct, pnl = False, 0.0
+    if decision == "AL":
+        correct, pnl = pct > 1.0, pct
+    elif decision == "SAT":
+        correct, pnl = pct < -1.0, -pct
+    elif decision == "BEKLE":
+        correct, pnl = (abs(pct) < 2.0 or (pct < 0 and score >= 40)), 0.0
+    elif decision == "İŞLEME GİRME":
+        correct = is_risky
+        pnl = 5.0 if correct else -2.0
+    pnl = round(pnl, 2)
+
+    s = st.session_state
+    s["balance"] = round(s["balance"] + pnl, 2)
+    s["balance_history"].append(s["balance"])
+    if correct:
+        s["correct"] += 1; s["streak"] += 1
+    else:
+        s["wrong"] += 1; s["streak"] = 0
+    if decision == "İŞLEME GİRME" and is_risky and correct:
+        s["risk_avoided"] += 1
+    old_goals = s["goals_done"]
+    for g in GOALS:
+        if g not in s["goals_reached"] and s["balance"] >= g:
+            s["goals_reached"].append(g); s["goals_done"] += 1
+
+    xp = 5 + (20 if correct else 5)
+    if s["goals_done"] > old_goals: xp += 50
+    if s["streak"] >= 3: xp += 30
+    s["xp"] += xp
+
+    new_badges = [f"{BADGES[b]['icon']} {b}" for b, info in BADGES.items()
+                  if b not in s["badges"] and info["cond"](s)]
+    s["badges"].extend(b.split(" ", 1)[1] for b in new_badges)
+
+    s["history"].append({"Hisse": sc["label"], "Karar": decision,
+                         "Doğru": "✅" if correct else "❌",
+                         "Değişim %": round(pct, 2), "P&L $": pnl, "Skor": score})
+    sc["_eval"] = {"correct": correct, "pnl": pnl, "pct_change": round(pct, 2)}
+    sc["_xp"] = xp
+    sc["_badges"] = new_badges
+    st.session_state["phase"] = "result"
+    st.session_state["scenario"] = sc
+
+
+def _sim_chart(df, df_future, title):
+    ema21, ema50 = compute_ema(df["Close"], 21), compute_ema(df["Close"], 50)
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.75, 0.25],
+                        vertical_spacing=0.04, subplot_titles=(title, "Hacim"))
+    fig.add_trace(go.Candlestick(x=df.index, open=df["Open"], high=df["High"], low=df["Low"],
+                  close=df["Close"], name="Geçmiş", increasing_line_color=C_UP,
+                  decreasing_line_color=C_DOWN), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df.index, y=ema21, name="EMA21", line=dict(color=C_GOLD, width=1)), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df.index, y=ema50, name="EMA50", line=dict(color=C_ACCENT, width=1)), row=1, col=1)
+    colors = [C_UP if c >= o else C_DOWN for c, o in zip(df["Close"], df["Open"])]
+    fig.add_trace(go.Bar(x=df.index, y=df["Volume"], name="Hacim", marker_color=colors, opacity=0.6), row=2, col=1)
+    if df_future is not None and len(df_future):
+        fig.add_trace(go.Candlestick(x=df_future.index, open=df_future["Open"], high=df_future["High"],
+                      low=df_future["Low"], close=df_future["Close"], name="Sonuç",
+                      increasing_line_color="#80cbc4", decreasing_line_color="#ef9a9a"), row=1, col=1)
+        fig.add_vline(x=df_future.index[0], line=dict(color="yellow", width=2, dash="dash"))
+    fig.update_layout(template="plotly_dark", paper_bgcolor="rgba(0,0,0,0)",
+                      plot_bgcolor="rgba(13,17,28,1)", height=520, xaxis_rangeslider_visible=False,
+                      legend=dict(orientation="h", y=1.02, x=1, xanchor="right"),
+                      margin=dict(l=10, r=10, t=50, b=10))
+    return fig
+
+
+def _sim_balance_chart():
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(y=st.session_state["balance_history"], mode="lines+markers",
+                  line=dict(color=C_ACCENT, width=2), fill="tozeroy"))
+    fig.add_hline(y=100, line=dict(color="rgba(255,255,255,0.3)", dash="dot"))
+    fig.update_layout(title="Bakiye Gelişimi", template="plotly_dark",
+                      paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(13,17,28,1)",
+                      height=240, margin=dict(l=10, r=10, t=40, b=10))
+    return fig
+
+
+# ===========================================================================
+# ANA UYGULAMA
+# ===========================================================================
+
+def main():
+    st.set_page_config(page_title="ABD Al/Sat Botu", page_icon="📈", layout="wide")
+
+    st.markdown("""
+    <style>
+    .mcard {background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.08);
+            border-radius:12px;padding:10px;text-align:center;}
+    .mval {font-size:1.3rem;font-weight:700;color:#3b82f6;}
+    .mlbl {font-size:0.72rem;color:#9ca3af;}
+    .badge {display:inline-block;background:rgba(240,185,11,0.15);border:1px solid #f0b90b;
+            border-radius:20px;padding:3px 10px;margin:3px;font-size:0.8rem;}
+    .stTabs [data-baseweb="tab-list"] {gap:8px;}
+    .stTabs [data-baseweb="tab"] {border-radius:8px 8px 0 0;padding:8px 18px;}
+    </style>
+    """, unsafe_allow_html=True)
+
+    st.markdown(
+        '<div style="background:rgba(234,57,67,0.1);border-left:3px solid #ea3943;'
+        'padding:8px 12px;border-radius:6px;font-size:0.8rem;color:#bbb;margin-bottom:12px;">'
+        '⚠️ Yatırım tavsiyesi değildir. Gerçek emir göndermez. Eğitim ve simülasyon amaçlıdır.</div>',
+        unsafe_allow_html=True)
+
+    st.title("📈 ABD Borsası Al/Sat Botu")
+
+    with st.sidebar:
+        st.title("⚙️ Ayarlar")
+        custom = st.text_input("Özel Ticker Listesi (virgülle)", "")
+        tickers = [t.strip().upper() for t in custom.split(",") if t.strip()] or list(DEFAULT_TICKERS)
+        period_label = st.selectbox("Zaman Aralığı", list(PERIOD_INTERVAL_MAP.keys()), index=2)
+        period, interval = PERIOD_INTERVAL_MAP[period_label]
+        st.divider()
+        st.subheader("UT Bot Parametreleri")
+        key_value = st.slider("Key Value (Hassasiyet)", 0.5, 5.0, 1.0, 0.1)
+        atr_period = st.slider("ATR Period", 1, 30, 10, 1)
+        st.divider()
+        st.subheader("Backtest")
+        initial_cash = st.number_input("Sermaye ($)", 100.0, 1_000_000.0, 10000.0, 100.0)
+        fee_pct = st.number_input("Komisyon (%)", 0.0, 1.0, 0.1, 0.01)
+        st.divider()
+        st.caption(f"Havuz: {len(tickers)} hisse")
+        st.caption(", ".join(tickers[:8]) + ("..." if len(tickers) > 8 else ""))
+
+    tab1, tab2, tab3 = st.tabs(
+        ["📡 Piyasa Tarayıcı", "🤖 Detaylı Analiz", "🎮 Simülasyon"])
+    with tab1:
+        page_scanner(tickers, period, interval, key_value, atr_period)
+    with tab2:
+        page_analysis(tickers, period, interval, key_value, atr_period, initial_cash, fee_pct)
+    with tab3:
+        page_simulation(tickers, period, interval)
+
+
+if __name__ == "__main__":
+    main()
