@@ -295,13 +295,19 @@ def scan_market(tickers: list, period: str, interval: str,
 
         score = compute_score(df)
         chg = (df["Close"].iloc[-1] - df["Close"].iloc[-2]) / df["Close"].iloc[-2] * 100
+        price = float(df["Close"].iloc[-1])
+        ut_stop = float(last["stop"])
+        bias = "LONG" if last["pos"] == 1 else "SHORT"
+        stop_dist = (price - ut_stop) / price * 100
         rows.append({
             "Hisse": t,
             "Sinyal": signal,
+            "Eğilim": bias,
             "Kaç Mum Önce": bars_ago if bars_ago is not None else "—",
-            "Fiyat": round(float(df["Close"].iloc[-1]), 2),
+            "Fiyat": round(price, 2),
+            "UT Stop": round(ut_stop, 2),
+            "Stop Mesafe %": round(stop_dist, 2),
             "Günlük %": round(float(chg), 2),
-            "Pozisyon": "LONG" if last["pos"] == 1 else "NAKİT",
             "Skor": score["total"],
             "RSI": score["rsi_val"],
             "Sistem": system_decision(score["total"]),
@@ -372,6 +378,107 @@ def make_equity_chart(equity_curve, index) -> go.Figure:
 
 
 # ===========================================================================
+# TRADE PLANI — Gerçek borsada kullanılabilir işlem parametreleri
+# ===========================================================================
+# Profesyonel trader'ların her işlemde hesapladığı şeyler:
+#   - Giriş fiyatı
+#   - Stop-loss (ATR / UT trailing stop bazlı) -> nerede yanıldığını kabul edersin
+#   - Kâr hedefleri TP1 (1.5R) ve TP2 (3R)     -> risk/ödül planı
+#   - Risk/Ödül oranı (R:R)
+#   - Pozisyon büyüklüğü -> hesabının yalnızca %X'ini riske atacak lot sayısı
+#   - Trend filtresi (EMA50) -> trende karşı işlemden kaçınma
+
+def build_trade_plan(df: pd.DataFrame, side: str,
+                     account_size: float = 10000.0, risk_pct: float = 1.0) -> dict:
+    """
+    df: ut_bot_signals çıktısı ('stop' ve 'atr' kolonları olmalı).
+    side: 'AL' (long) veya 'SAT' (short).
+    Gerçek bir işlemde girilecek tüm parametreleri döner.
+    """
+    last = df.iloc[-1]
+    entry = float(last["Close"])
+    atr = float(last["atr"]) if not pd.isna(last["atr"]) else entry * 0.02
+    ut_stop = float(last["stop"])
+
+    if side == "AL":   # LONG
+        # Stop: UT stop ile ATR bazlı stop'tan hangisi daha koruyucuysa (daha yakın olan değil,
+        # mantıklı olan) — burada ikisinin daha düşüğünü alıp makul bir tampon bırakıyoruz.
+        atr_stop = entry - 1.5 * atr
+        stop = min(ut_stop, atr_stop) if ut_stop < entry else atr_stop
+        risk_per_share = max(entry - stop, entry * 0.001)
+        tp1 = entry + 1.5 * risk_per_share
+        tp2 = entry + 3.0 * risk_per_share
+    else:              # SHORT
+        atr_stop = entry + 1.5 * atr
+        stop = max(ut_stop, atr_stop) if ut_stop > entry else atr_stop
+        risk_per_share = max(stop - entry, entry * 0.001)
+        tp1 = entry - 1.5 * risk_per_share
+        tp2 = entry - 3.0 * risk_per_share
+
+    risk_amount = account_size * risk_pct / 100.0
+    shares = risk_amount / risk_per_share if risk_per_share > 0 else 0
+    position_value = shares * entry
+
+    # Trend filtresi (yeterli veri varsa EMA50)
+    ema50 = compute_ema(df["Close"], 50)
+    trend = "—"
+    if len(df) >= 50:
+        if entry > ema50.iloc[-1] and ema50.iloc[-1] > ema50.iloc[-5]:
+            trend = "Yukarı (EMA50 üstünde ve yükseliyor)"
+        elif entry < ema50.iloc[-1] and ema50.iloc[-1] < ema50.iloc[-5]:
+            trend = "Aşağı (EMA50 altında ve düşüyor)"
+        else:
+            trend = "Yatay / kararsız"
+
+    # Trend uyumu uyarısı
+    aligned = (side == "AL" and "Yukarı" in trend) or (side == "SAT" and "Aşağı" in trend)
+
+    return {
+        "side": side,
+        "entry": round(entry, 2),
+        "stop": round(stop, 2),
+        "stop_pct": round((stop - entry) / entry * 100, 2),
+        "tp1": round(tp1, 2),
+        "tp2": round(tp2, 2),
+        "tp1_pct": round((tp1 - entry) / entry * 100, 2),
+        "tp2_pct": round((tp2 - entry) / entry * 100, 2),
+        "risk_per_share": round(risk_per_share, 2),
+        "rr": "1:1.5  /  1:3",
+        "shares": int(shares),
+        "position_value": round(position_value, 2),
+        "risk_amount": round(risk_amount, 2),
+        "atr": round(atr, 2),
+        "trend": trend,
+        "aligned": aligned,
+    }
+
+
+def render_trade_plan(plan: dict):
+    """Trade planını Streamlit kartı olarak çizer."""
+    side_txt = "🟢 LONG (AL)" if plan["side"] == "AL" else "🔴 SHORT (SAT)"
+    st.markdown(f"##### 📋 Trade Planı — {side_txt}")
+    c = st.columns(4)
+    c[0].metric("Giriş", f"${plan['entry']}")
+    c[1].metric("🛑 Stop-Loss", f"${plan['stop']}", delta=f"{plan['stop_pct']}%")
+    c[2].metric("🎯 Hedef 1 (1.5R)", f"${plan['tp1']}", delta=f"{plan['tp1_pct']}%")
+    c[3].metric("🎯 Hedef 2 (3R)", f"${plan['tp2']}", delta=f"{plan['tp2_pct']}%")
+
+    c2 = st.columns(4)
+    c2[0].metric("Pozisyon (lot)", f"{plan['shares']} adet")
+    c2[1].metric("Pozisyon Değeri", f"${plan['position_value']:,.0f}")
+    c2[2].metric("Riske Atılan", f"${plan['risk_amount']:,.0f}")
+    c2[3].metric("Risk/Ödül", plan["rr"])
+
+    if plan["trend"] != "—":
+        if plan["aligned"]:
+            st.success(f"✅ Trend uyumlu: {plan['trend']} — işlem trend yönünde.")
+        else:
+            st.warning(f"⚠️ Trende dikkat: {plan['trend']} — işlemin trende karşı olabilir, risk yüksek.")
+    st.caption(f"Hesaplama: ATR ${plan['atr']} • Hisse başı risk ${plan['risk_per_share']} • "
+               "Stop'a değerse kaybın 'Riske Atılan' tutarıdır. Bu bir emir değildir, plan şablonudur.")
+
+
+# ===========================================================================
 # SİMÜLASYON OYUNU (app.py'den uyarlandı)
 # ===========================================================================
 
@@ -419,9 +526,18 @@ def xp_to_level(xp: int) -> int:
 # SAYFALAR
 # ===========================================================================
 
-def page_scanner(tickers, period, interval, key_value, atr_period):
+def _scan_card(r, color, sub):
+    return (
+        f'<div style="background:rgba({color},0.12);border-left:4px solid rgb({color});'
+        f'border-radius:8px;padding:10px 14px;margin-bottom:8px;">'
+        f'<b style="font-size:1.1rem;">{r["Hisse"]}</b> &nbsp; ${r["Fiyat"]} '
+        f'<span style="color:{C_UP if r["Günlük %"]>=0 else C_DOWN};">({r["Günlük %"]:+}%)</span><br>'
+        f'<span style="color:#aaa;font-size:0.8rem;">{sub}</span></div>')
+
+
+def page_scanner(tickers, period, interval, key_value, atr_period, initial_cash=10000.0, risk_pct=1.0):
     st.subheader("📡 Piyasa Tarayıcı")
-    st.caption("Tüm hisse havuzu UT Bot mantığıyla taranır. AL/SAT sinyali verenler en üstte gruplanır.")
+    st.caption("Tüm hisse havuzu UT Bot mantığıyla taranır. AL/SAT sinyali verenler ve eğilim adayları gruplanır.")
 
     lookback = st.slider("Sinyal Tazeliği (son kaç mumda sinyal aransın)", 1, 10, 3,
                          help="1 = sadece en son mumda sinyal verenler")
@@ -436,34 +552,39 @@ def page_scanner(tickers, period, interval, key_value, atr_period):
 
     buy_list = df[df["Sinyal"] == "AL"].sort_values("Kaç Mum Önce")
     sell_list = df[df["Sinyal"] == "SAT"].sort_values("Kaç Mum Önce")
+    # Sinyal yoksa eğilim adayları (gerçek borsada izleme listesi mantığı)
+    long_watch = df[(df["Sinyal"] == "—") & (df["Eğilim"] == "LONG")].sort_values("Skor", ascending=False)
+    short_watch = df[(df["Sinyal"] == "—") & (df["Eğilim"] == "SHORT")].sort_values("Skor")
 
     col1, col2 = st.columns(2)
     with col1:
         st.markdown(f"### 🟢 AL Sinyali ({len(buy_list)})")
         if buy_list.empty:
-            st.caption("Sinyal yok.")
-        else:
-            for _, r in buy_list.iterrows():
-                st.markdown(
-                    f'<div style="background:rgba(22,199,132,0.12);border-left:4px solid {C_UP};'
-                    f'border-radius:8px;padding:10px 14px;margin-bottom:8px;">'
-                    f'<b style="font-size:1.1rem;">{r["Hisse"]}</b> &nbsp; ${r["Fiyat"]} '
-                    f'<span style="color:{C_UP if r["Günlük %"]>=0 else C_DOWN};">({r["Günlük %"]:+}%)</span><br>'
-                    f'<span style="color:#aaa;font-size:0.8rem;">{r["Kaç Mum Önce"]} mum önce • Skor {r["Skor"]}/100 • RSI {r["RSI"]}</span>'
-                    f'</div>', unsafe_allow_html=True)
+            st.caption("Taze AL sinyali yok.")
+        for _, r in buy_list.iterrows():
+            st.markdown(_scan_card(r, "22,199,132",
+                f'{r["Kaç Mum Önce"]} mum önce • Skor {r["Skor"]}/100 • RSI {r["RSI"]} • Stop ${r["UT Stop"]}'),
+                unsafe_allow_html=True)
+        if not long_watch.empty:
+            st.markdown("**🟩 Yükseliş eğilimli (izleme):**")
+            for _, r in long_watch.head(6).iterrows():
+                st.markdown(_scan_card(r, "22,199,132",
+                    f'LONG eğilim • Skor {r["Skor"]}/100 • RSI {r["RSI"]} • Stop ${r["UT Stop"]} (%{r["Stop Mesafe %"]})'),
+                    unsafe_allow_html=True)
     with col2:
         st.markdown(f"### 🔴 SAT Sinyali ({len(sell_list)})")
         if sell_list.empty:
-            st.caption("Sinyal yok.")
-        else:
-            for _, r in sell_list.iterrows():
-                st.markdown(
-                    f'<div style="background:rgba(234,57,67,0.12);border-left:4px solid {C_DOWN};'
-                    f'border-radius:8px;padding:10px 14px;margin-bottom:8px;">'
-                    f'<b style="font-size:1.1rem;">{r["Hisse"]}</b> &nbsp; ${r["Fiyat"]} '
-                    f'<span style="color:{C_UP if r["Günlük %"]>=0 else C_DOWN};">({r["Günlük %"]:+}%)</span><br>'
-                    f'<span style="color:#aaa;font-size:0.8rem;">{r["Kaç Mum Önce"]} mum önce • Skor {r["Skor"]}/100 • RSI {r["RSI"]}</span>'
-                    f'</div>', unsafe_allow_html=True)
+            st.caption("Taze SAT sinyali yok — piyasa düşüş sinyali üretmiyor (genelde yükseliş eğiliminde sağlıklıdır).")
+        for _, r in sell_list.iterrows():
+            st.markdown(_scan_card(r, "234,57,67",
+                f'{r["Kaç Mum Önce"]} mum önce • Skor {r["Skor"]}/100 • RSI {r["RSI"]} • Stop ${r["UT Stop"]}'),
+                unsafe_allow_html=True)
+        if not short_watch.empty:
+            st.markdown("**🟥 Zayıf / düşüş eğilimli (izleme veya kaçın):**")
+            for _, r in short_watch.head(6).iterrows():
+                st.markdown(_scan_card(r, "234,57,67",
+                    f'SHORT eğilim • Skor {r["Skor"]}/100 • RSI {r["RSI"]} • Fiyat UT stop altında'),
+                    unsafe_allow_html=True)
 
     st.divider()
     st.markdown("#### 📊 Tüm Hisseler")
@@ -472,12 +593,16 @@ def page_scanner(tickers, period, interval, key_value, atr_period):
         use_container_width=True, hide_index=True,
         column_config={
             "Günlük %": st.column_config.NumberColumn(format="%.2f%%"),
+            "Stop Mesafe %": st.column_config.NumberColumn(format="%.2f%%"),
             "Skor": st.column_config.ProgressColumn(min_value=0, max_value=100, format="%d"),
         },
     )
+    st.caption("**Eğilim:** Fiyat UT stop'un üstündeyse LONG, altındaysa SHORT. "
+               "**UT Stop:** trailing stop seviyesi — long pozisyonda stop-loss olarak kullanılabilir. "
+               "**Stop Mesafe %:** fiyatın stop'a uzaklığı (risk göstergesi).")
 
 
-def page_analysis(tickers, period, interval, key_value, atr_period, initial_cash, fee_pct):
+def page_analysis(tickers, period, interval, key_value, atr_period, initial_cash, fee_pct, risk_pct=1.0):
     st.subheader("🤖 Detaylı Hisse Analizi")
     pool = tickers + (["BTC-USD", "ETH-USD"])
     sel = st.selectbox("Hisse Seç", pool, index=0)
@@ -493,15 +618,22 @@ def page_analysis(tickers, period, interval, key_value, atr_period, initial_cash
     result = backtest(df, initial_cash, fee_pct)
     score = compute_score(df)
 
-    # Güncel sinyal
+    # Güncel sinyal + bias
     last = df.iloc[-1]
+    bias = "AL" if last["pos"] == 1 else "SAT"   # stop üstü=long bias, altı=short bias
     if last["buy"]:
         st.success(f"🟢 **GÜNCEL SİNYAL: AL** — {ticker} @ ${last['Close']:.2f}")
     elif last["sell"]:
         st.error(f"🔴 **GÜNCEL SİNYAL: SAT** — {ticker} @ ${last['Close']:.2f}")
     else:
-        durum = "LONG (pozisyonda)" if last["pos"] == 1 else "NAKİT"
-        st.info(f"⚪ Yeni sinyal yok • Bot durumu: **{durum}** • Fiyat: ${last['Close']:.2f}")
+        durum = "LONG eğilimi (fiyat UT stop üstünde)" if last["pos"] == 1 else "SHORT eğilimi (fiyat UT stop altında)"
+        st.info(f"⚪ Yeni sinyal yok • Eğilim: **{durum}** • Fiyat: ${last['Close']:.2f}")
+
+    # Trade planı (güncel sinyal varsa o yön, yoksa mevcut eğilim yönünde)
+    plan_side = "AL" if last["buy"] else ("SAT" if last["sell"] else bias)
+    plan = build_trade_plan(df, plan_side, account_size=initial_cash, risk_pct=risk_pct)
+    render_trade_plan(plan)
+    st.divider()
 
     # Metrikler
     m = st.columns(5)
@@ -535,8 +667,10 @@ def page_analysis(tickers, period, interval, key_value, atr_period, initial_cash
         st.warning("Bu ayarlarla işlem sinyali üretilmedi.")
 
 
-def page_simulation(tickers, period, interval):
+def page_simulation(tickers, period, interval, initial_cash=10000.0, risk_pct=1.0):
     init_sim_state()
+    st.session_state["_sim_account"] = initial_cash
+    st.session_state["_sim_risk"] = risk_pct
     st.subheader("🎮 Trading Simülasyon Oyunu")
     st.caption("Grafiği analiz et, kararını ver, sonucu gör. $100 sanal bakiye ile başla.")
 
@@ -578,10 +712,11 @@ def page_simulation(tickers, period, interval):
         if df is None:
             st.error("Veri alınamadı.")
         else:
-            _setup_scenario(df, "Gizli Hisse")
+            _setup_scenario(df, "Gizli Hisse", ticker=chosen, interval=interval)
     if c2.button("🎲 Yeni Senaryo (Sentetik)", use_container_width=True):
         stype = random.choice(SYNTHETIC_TYPES)
-        _setup_scenario(generate_synthetic_data(stype), f"Sentetik ({stype})")
+        _setup_scenario(generate_synthetic_data(stype), f"Sentetik ({stype})",
+                        ticker=None, interval="1d", synth_type=stype)
 
     sc = st.session_state.get("scenario")
     if sc is None:
@@ -600,6 +735,13 @@ def page_simulation(tickers, period, interval):
 
     if phase == "showing":
         st.markdown("### 🎯 Kararını Ver")
+        rc1, rc2 = st.columns([3, 1])
+        reason = rc1.text_input("📝 Neden bu kararı veriyorsun? (günlüğe işlenir)",
+                                key="pending_reason",
+                                placeholder="örn. fiyat EMA50 üstünde tutundu, hacim arttı")
+        emotion = rc2.selectbox("Duygu durumu",
+                                ["—", "😎 Güvenli", "😟 Tereddütlü", "😱 FOMO", "😐 Nötr"],
+                                key="pending_emotion")
         d = st.columns(4)
         decision = None
         if d[0].button("🟢 AL", use_container_width=True): decision = "AL"
@@ -607,7 +749,7 @@ def page_simulation(tickers, period, interval):
         if d[2].button("🟡 BEKLE", use_container_width=True): decision = "BEKLE"
         if d[3].button("⬜ GİRME", use_container_width=True): decision = "İŞLEME GİRME"
         if decision:
-            _resolve_decision(decision, sc)
+            _resolve_decision(decision, sc, reason=reason, emotion=emotion)
             st.rerun()
 
     if phase == "result" and "_eval" in sc:
@@ -619,29 +761,179 @@ def page_simulation(tickers, period, interval):
         if sc.get("_badges"):
             st.balloons()
             st.success("🏅 Yeni Rozet: " + ", ".join(sc["_badges"]))
-        dir_ = "yükseldi" if ev["pct_change"] > 0 else "düştü"
-        st.markdown(f"**Rapor:** Sonuç bölgesinde fiyat **%{abs(ev['pct_change']):.2f}** {dir_}. "
-                    f"Sistem skoru {sc['score']['total']}/100 ({system_decision(sc['score']['total'])}). "
-                    f"Formasyonlar: {', '.join(sc['score']['formations'])}.")
+
+        # Hisse adı + tarih açıklaması (karardan sonra ortaya çıkar)
+        reveal = sc["ticker"] if sc["ticker"] else sc["label"]
+        st.markdown(f"#### 🔎 Bu grafik: **{reveal}**")
+        with st.container():
+            st.markdown(build_sim_report(sc, ev), unsafe_allow_html=False)
+
+        # 📋 Karar anındaki gerçek trade planı (eğitim amaçlı, gerçek borsa parametreleri)
+        with st.expander("📋 Karar Anındaki Trade Planı (gerçek borsa mantığı)", expanded=True):
+            karar = st.session_state["decision"]
+            plan_side = "SAT" if karar == "SAT" else "AL"
+            sig_show = ut_bot_signals(sc["df_show"], 1.0, 10)
+            plan = build_trade_plan(sig_show, plan_side,
+                                    account_size=st.session_state.get("_sim_account", 10000.0),
+                                    risk_pct=st.session_state.get("_sim_risk", 1.0))
+            render_trade_plan(plan)
+            st.caption("Bu plan, kararı verdiğin andaki fiyatla gerçek bir işlemde kullanacağın "
+                       "stop, hedef ve pozisyon büyüklüğünü gösterir — böylece sadece yön değil, "
+                       "risk yönetimini de pratik edersin.")
+
+        # 📖 Grafik okuma dersi
+        with st.expander("📖 Grafik Okuma Dersi", expanded=True):
+            st.markdown(build_chart_lesson(sc, ev))
+
+        # Karardan çıkardığın ders -> son günlük kaydına işlenir
+        st.markdown("##### ✍️ Bu trade'den çıkardığın ders")
+        lesson = st.text_input("Notunu yaz, günlüğüne kaydedilsin:",
+                               key=f"lesson_{len(st.session_state['history'])}",
+                               placeholder="örn. RSI 70 üstündeyken AL'a girmemeliydim, risk/ödül kötüydü")
+        if st.button("💾 Dersi Günlüğe Kaydet"):
+            if st.session_state["history"]:
+                st.session_state["history"][-1]["Ders"] = lesson.strip() or "—"
+                st.success("Ders günlüğe kaydedildi.")
+
         st.plotly_chart(_sim_balance_chart(), use_container_width=True)
 
-    if st.session_state["history"]:
-        with st.expander("📋 Karar Geçmişi"):
-            st.dataframe(pd.DataFrame(st.session_state["history"]),
-                         use_container_width=True, hide_index=True)
+    _render_journal()
 
 
-def _setup_scenario(df, label):
+def _setup_scenario(df, label, ticker=None, interval="1d", synth_type=None):
     n = len(df)
     split = int(n * 0.67)
     sc = {"df_show": df.iloc[:split].copy(), "df_future": df.iloc[split:].copy(),
-          "label": label, "score": compute_score(df.iloc[:split])}
+          "label": label, "score": compute_score(df.iloc[:split]),
+          "ticker": ticker, "interval": interval, "synth_type": synth_type}
     st.session_state["scenario"] = sc
     st.session_state["phase"] = "ready"
     st.rerun()
 
 
-def _resolve_decision(decision, sc):
+# Her senaryoda dönüşümlü gösterilen genel trade prensipleri
+TRADE_TIPS = [
+    "Plan olmadan işleme girme: girişten önce stop ve hedefini belirle.",
+    "Trend dostundur — trende karşı işlem, akıntıya karşı yüzmektir.",
+    "Teyit bekle: tek bir mum değil, yapının onayı (kapanış + hacim) önemlidir.",
+    "Risk/ödül en az 1:2 olmayan işlemler uzun vadede seni yorar.",
+    "RSI aşırı alımda (70+) trend bitmez ama yeni alımın risk/ödülü kötüleşir.",
+    "Hacimsiz kırılımlar genelde sahte (fake breakout) çıkar.",
+    "En iyi işlem bazen hiç işlem yapmamaktır — nakitte beklemek de bir pozisyondur.",
+    "Geçmiş senin değil piyasanın hikayesi; her mumun arkasında bir karar vardır.",
+]
+
+
+def build_chart_lesson(sc, ev) -> str:
+    """Bu senaryoya özel, öğretici grafik okuma dersi üretir."""
+    show = sc["df_show"]
+    score = sc["score"]
+    close = show["Close"]
+    ema21, ema50 = compute_ema(close, 21), compute_ema(close, 50)
+    rsi = compute_rsi(close).iloc[-1]
+    rsi = round(rsi, 1) if not pd.isna(rsi) else 50
+    last = float(close.iloc[-1])
+    vol_now = show["Volume"].iloc[-1]
+    vol_avg = show["Volume"].iloc[-20:].mean()
+
+    lines = ["**Bu grafikte nelere bakmalıydın:**", ""]
+
+    # EMA dizilimi dersi
+    if last > ema21.iloc[-1] > ema50.iloc[-1]:
+        lines.append("- 🟢 **EMA dizilimi:** Fiyat > EMA21 > EMA50 → boğalar kontrolde. "
+                     "Bu dizilimde geri çekilmeler (EMA21'e dönüş) genelde alım fırsatıdır.")
+    elif last < ema21.iloc[-1] < ema50.iloc[-1]:
+        lines.append("- 🔴 **EMA dizilimi:** Fiyat < EMA21 < EMA50 → ayılar kontrolde. "
+                     "Bu yapıda yükselişler genelde satış fırsatı (zayıf tepki) olur.")
+    else:
+        lines.append("- 🟡 **EMA dizilimi:** Ortalamalar iç içe → yön belirsiz. "
+                     "Bu tür sıkışmalarda kırılım gelene kadar beklemek mantıklıdır.")
+
+    # RSI dersi
+    if rsi > 70:
+        lines.append(f"- **RSI {rsi}:** Aşırı alım. Trend güçlü ama momentum yorulmuş olabilir; "
+                     "yeni girişte risk/ödül kötüdür.")
+    elif rsi < 30:
+        lines.append(f"- **RSI {rsi}:** Aşırı satım. Sert düşüş sonrası tepki gelebilir ama "
+                     "düşen bıçağı tutmak risklidir; dönüş teyidi bekle.")
+    elif rsi > 55:
+        lines.append(f"- **RSI {rsi}:** Pozitif momentum, alıcılar aktif.")
+    elif rsi < 45:
+        lines.append(f"- **RSI {rsi}:** Negatif momentum, satıcılar baskın.")
+    else:
+        lines.append(f"- **RSI {rsi}:** Nötr bölge, net yön yok.")
+
+    # Hacim dersi
+    if vol_now > vol_avg * 1.5:
+        lines.append("- **Hacim:** Son mumda hacim ortalamanın belirgin üstünde → hareket teyitli, "
+                     "kurumsal ilgi olabilir.")
+    elif vol_now < vol_avg * 0.6:
+        lines.append("- **Hacim:** Hacim düşük → hareketin arkasında güç az, kırılımlar güvenilmez.")
+    else:
+        lines.append("- **Hacim:** Normal seviyede, belirleyici değil.")
+
+    # Formasyon dersi
+    if score["formations"]:
+        lines.append(f"- **Formasyon(lar):** {', '.join(score['formations'])} — "
+                     "bu yapılar fiyatın bir sonraki olası yönü hakkında ipucu verir.")
+
+    # Sonuçtan ders
+    lines.append("")
+    if ev["correct"]:
+        lines.append("✅ **Sonuç teyidi:** Okuduğun yapı ile fiyatın gittiği yön örtüştü. "
+                     "Doğru okuma + doğru karar = tekrarlanabilir başarı.")
+    else:
+        lines.append("📌 **Çıkarım:** Yapı ile sonuç farklı çıktı. Bu normaldir — hiçbir kurulum %100 değildir. "
+                     "Önemli olan tutarlı kurallarla işlem yapıp zararı küçük tutmaktır.")
+
+    # Dönüşümlü genel ipucu
+    tip = TRADE_TIPS[len(st.session_state["history"]) % len(TRADE_TIPS)]
+    lines.append("")
+    lines.append(f"> 💡 **Günün prensibi:** {tip}")
+
+    return "\n".join(lines)
+
+
+def _render_journal():
+    """Trade günlüğü paneli: özet + tablo + CSV indir/yükle."""
+    hist = st.session_state["history"]
+    with st.expander(f"📓 Trade Günlüğü ({len(hist)} kayıt)", expanded=False):
+        # CSV yükleme
+        up = st.file_uploader("Eski günlüğü yükle (CSV)", type="csv", key="journal_upload")
+        if up is not None and st.button("📂 Yüklenen günlüğü içe aktar"):
+            try:
+                loaded = pd.read_csv(up).to_dict("records")
+                st.session_state["history"] = loaded + hist
+                st.success(f"{len(loaded)} kayıt içe aktarıldı.")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Yükleme hatası: {e}")
+
+        if not hist:
+            st.info("Henüz kayıt yok. Bir senaryo oyna, kararın ve gerekçen buraya işlensin.")
+            return
+
+        df = pd.DataFrame(hist)
+
+        # Kısa özet / içgörü
+        total = len(df)
+        wins = (df["Doğru"] == "✅").sum()
+        wr = wins / total * 100 if total else 0
+        most_decision = df["Karar"].mode()[0] if total else "—"
+        emo = df[df["Duygu"] != "—"]["Duygu"]
+        most_emo = emo.mode()[0] if not emo.empty else "—"
+        st.markdown(
+            f"**Özet:** {total} trade • Başarı **%{wr:.0f}** • En sık kararın **{most_decision}** • "
+            f"En sık duygu **{most_emo}**")
+
+        st.dataframe(df, use_container_width=True, hide_index=True)
+
+        csv = df.to_csv(index=False).encode("utf-8-sig")
+        st.download_button("⬇️ Günlüğü CSV indir", csv,
+                           file_name="trade_gunlugu.csv", mime="text/csv")
+
+
+def _resolve_decision(decision, sc, reason="", emotion="—"):
     fut = sc["df_future"]
     entry, exit_ = fut["Close"].iloc[0], fut["Close"].iloc[-1]
     pct = (exit_ - entry) / entry * 100
@@ -660,6 +952,7 @@ def _resolve_decision(decision, sc):
     pnl = round(pnl, 2)
 
     s = st.session_state
+    s["decision"] = decision
     s["balance"] = round(s["balance"] + pnl, 2)
     s["balance_history"].append(s["balance"])
     if correct:
@@ -682,9 +975,16 @@ def _resolve_decision(decision, sc):
                   if b not in s["badges"] and info["cond"](s)]
     s["badges"].extend(b.split(" ", 1)[1] for b in new_badges)
 
-    s["history"].append({"Hisse": sc["label"], "Karar": decision,
-                         "Doğru": "✅" if correct else "❌",
-                         "Değişim %": round(pct, 2), "P&L $": pnl, "Skor": score})
+    s["history"].append({
+        "Tarih": datetime.now().strftime("%d.%m %H:%M"),
+        "Hisse": sc["ticker"] if sc["ticker"] else sc["label"],
+        "Karar": decision,
+        "Doğru": "✅" if correct else "❌",
+        "Değişim %": round(pct, 2), "P&L $": pnl, "Skor": score,
+        "Gerekçe": reason.strip() or "—",
+        "Duygu": emotion if emotion != "—" else "—",
+        "Ders": "",
+    })
     sc["_eval"] = {"correct": correct, "pnl": pnl, "pct_change": round(pct, 2)}
     sc["_xp"] = xp
     sc["_badges"] = new_badges
@@ -692,26 +992,193 @@ def _resolve_decision(decision, sc):
     st.session_state["scenario"] = sc
 
 
+def _fmt_date(ts) -> str:
+    """Tarihi okunur Türkçe biçime çevirir."""
+    try:
+        return pd.Timestamp(ts).strftime("%d.%m.%Y")
+    except Exception:
+        return str(ts)
+
+
+def build_sim_report(sc, ev) -> str:
+    """Karardan sonra: hisse adı, tarih ve teknik neden-sonuç raporu."""
+    show, fut = sc["df_show"], sc["df_future"]
+    score = sc["score"]
+    name = sc["ticker"] if sc["ticker"] else sc["label"]
+
+    # Tarih bilgileri
+    show_start, decision_date = _fmt_date(show.index[0]), _fmt_date(show.index[-1])
+    fut_end = _fmt_date(fut.index[-1])
+
+    # Karar anındaki teknik durum
+    close = show["Close"]
+    ema21, ema50 = compute_ema(close, 21), compute_ema(close, 50)
+    rsi = compute_rsi(close).iloc[-1]
+    rsi = round(rsi, 1) if not pd.isna(rsi) else 50
+    last = float(close.iloc[-1])
+    trend_txt = ("yükselen trend (fiyat EMA21 ve EMA50'nin üzerinde)"
+                 if last > ema21.iloc[-1] and last > ema50.iloc[-1]
+                 else "düşen/zayıf trend (fiyat ortalamaların altında)"
+                 if last < ema21.iloc[-1] and last < ema50.iloc[-1]
+                 else "yatay/kararsız seyir")
+    rsi_txt = ("aşırı alım bölgesine yakın (momentum güçlü ama tepe riski var)" if rsi > 70
+               else "pozitif momentum" if rsi > 55
+               else "zayıf/negatif momentum" if rsi < 45
+               else "nötr momentum")
+
+    # Sonuç bölgesinde ne oldu
+    pct = ev["pct_change"]
+    dir_ = "yükseldi 📈" if pct > 0 else "düştü 📉"
+    fut_high = (fut["High"].max() - fut["Close"].iloc[0]) / fut["Close"].iloc[0] * 100
+    fut_low = (fut["Low"].min() - fut["Close"].iloc[0]) / fut["Close"].iloc[0] * 100
+
+    # UT Bot sonuç bölgesinde sinyal verdi mi?
+    full = pd.concat([show, fut])
+    sig = ut_bot_signals(full, 1.0, 10).iloc[len(show):]
+    ut_txt = ""
+    if sig["buy"].any():
+        ut_txt = "Sonuç bölgesinde **UT Bot AL sinyali** üretti. "
+    elif sig["sell"].any():
+        ut_txt = "Sonuç bölgesinde **UT Bot SAT sinyali** üretti. "
+
+    # Karar yorumu
+    karar = st.session_state["decision"]
+    sonuc = "✅ doğru" if ev["correct"] else "❌ yanlış"
+
+    src_txt = (f"Bu, **{name}** hissesinin gerçek piyasa verisidir."
+               if sc["ticker"] else
+               f"Bu, **{name}** türünde sentetik (yapay) olarak üretilmiş bir grafiktir.")
+
+    report = f"""
+{src_txt}
+
+**🗓️ Zaman aralığı**
+- Karar bölgesi (sana gösterilen kısım): **{show_start} → {decision_date}**
+- Sonuç bölgesi (karardan sonrası): **{decision_date} → {fut_end}**
+
+**📊 Karar anındaki teknik tablo ({decision_date})**
+- Trend: {trend_txt}
+- RSI: **{rsi}** — {rsi_txt}
+- Sistem skoru: **{score['total']}/100** → {system_decision(score['total'])}
+- Tespit edilen formasyonlar: {', '.join(score['formations']) if score['formations'] else 'belirgin formasyon yok'}
+
+**📈 Sonuç bölgesinde ne oldu?**
+- Fiyat toplamda **%{abs(pct):.2f}** {dir_}
+- Bu süreçte en fazla **%{fut_high:.1f}** yukarı, **%{fut_low:.1f}** aşağı hareket etti.
+- {ut_txt}
+
+**🧠 Neden böyle hareket etti? (teknik açıklama)**
+{_explain_move(score, pct, rsi, sc)}
+
+**🎯 Senin kararın:** {karar} → sonuç **{sonuc}**.
+{_explain_decision(karar, pct, ev['correct'], score['total'])}
+"""
+    return report
+
+
+def _explain_move(score, pct, rsi, sc) -> str:
+    """Fiyat hareketinin teknik gerekçesini üretir."""
+    parts = []
+    up = pct > 0
+    if score["total"] >= 70 and up:
+        parts.append("Karar anında trend, EMA dizilimi ve hacim birlikte yukarı yönü destekliyordu; "
+                     "bu güçlü yapı yükselişin devam etmesini olası kıldı.")
+    elif score["total"] < 40 and not up:
+        parts.append("Karar anında teknik tablo zayıftı (trend ve momentum negatif); "
+                     "bu zayıflık sonraki düşüşe zemin hazırladı.")
+    elif up and rsi < 45:
+        parts.append("Momentum zayıf görünmesine rağmen fiyat toparladı — bu, beklenmedik bir alıcı ilgisi "
+                     "veya kısa vadeli tepki alımı (pullback sonrası dönüş) olabilir.")
+    elif not up and rsi > 70:
+        parts.append("RSI aşırı alım bölgesindeydi; yükseliş yorulmuş, kâr satışları gelmiş ve fiyat geri çekilmiştir.")
+    else:
+        parts.append("Teknik göstergeler karışık sinyal veriyordu; bu tür ortamlarda fiyat yönü "
+                     "haber akışı ve piyasa duyarlılığıyla şekillenir, kestirmesi zordur.")
+    if sc.get("synth_type"):
+        parts.append(f"(Not: bu sentetik grafik '{sc['synth_type']}' senaryosu olarak üretildi.)")
+    return " ".join(parts)
+
+
+def _explain_decision(karar, pct, correct, total) -> str:
+    if karar == "AL":
+        return ("Yükseliş beklentin gerçekleşti." if pct > 1 else
+                "Beklenen yükseliş gelmedi; alım için yapı yeterince güçlü değildi.")
+    if karar == "SAT":
+        return ("Düşüş beklentin gerçekleşti." if pct < -1 else
+                "Beklenen düşüş gelmedi; fiyat aksine güçlü kaldı.")
+    if karar == "BEKLE":
+        return ("Belirsiz ortamda beklemek mantıklıydı." if correct else
+                "Burada net bir fırsat vardı; beklemek fırsatı kaçırttı.")
+    return ("Zayıf kurulumda işleme girmemek doğru bir risk yönetimiydi." if correct else
+            "Aslında işleme girilebilecek bir yapı vardı; fazla temkinli davranıldı.")
+
+
 def _sim_chart(df, df_future, title):
-    ema21, ema50 = compute_ema(df["Close"], 21), compute_ema(df["Close"], 50)
-    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.75, 0.25],
-                        vertical_spacing=0.04, subplot_titles=(title, "Hacim"))
+    """Profesyonel görünümlü mum + EMA + RSI + hacim grafiği."""
+    full_close = pd.concat([df["Close"], df_future["Close"]]) if df_future is not None and len(df_future) else df["Close"]
+    ema21 = compute_ema(full_close, 21)
+    ema50 = compute_ema(full_close, 50)
+    rsi_full = compute_rsi(full_close)
+
+    fig = make_subplots(rows=3, cols=1, shared_xaxes=True,
+                        row_heights=[0.62, 0.18, 0.20], vertical_spacing=0.025,
+                        subplot_titles=(title, "Hacim", "RSI (14)"))
+
+    # Geçmiş (karar bölgesi)
     fig.add_trace(go.Candlestick(x=df.index, open=df["Open"], high=df["High"], low=df["Low"],
-                  close=df["Close"], name="Geçmiş", increasing_line_color=C_UP,
-                  decreasing_line_color=C_DOWN), row=1, col=1)
-    fig.add_trace(go.Scatter(x=df.index, y=ema21, name="EMA21", line=dict(color=C_GOLD, width=1)), row=1, col=1)
-    fig.add_trace(go.Scatter(x=df.index, y=ema50, name="EMA50", line=dict(color=C_ACCENT, width=1)), row=1, col=1)
+                  close=df["Close"], name="Karar Bölgesi", increasing_line_color=C_UP,
+                  decreasing_line_color=C_DOWN, increasing_fillcolor=C_UP,
+                  decreasing_fillcolor=C_DOWN, line=dict(width=1)), row=1, col=1)
+
+    # EMA çizgileri (tüm seri boyunca)
+    fig.add_trace(go.Scatter(x=ema21.index, y=ema21, name="EMA21",
+                  line=dict(color=C_GOLD, width=1.3)), row=1, col=1)
+    fig.add_trace(go.Scatter(x=ema50.index, y=ema50, name="EMA50",
+                  line=dict(color=C_ACCENT, width=1.3)), row=1, col=1)
+
+    # Hacim - karar bölgesi
     colors = [C_UP if c >= o else C_DOWN for c, o in zip(df["Close"], df["Open"])]
-    fig.add_trace(go.Bar(x=df.index, y=df["Volume"], name="Hacim", marker_color=colors, opacity=0.6), row=2, col=1)
+    fig.add_trace(go.Bar(x=df.index, y=df["Volume"], name="Hacim",
+                  marker_color=colors, opacity=0.55), row=2, col=1)
+
+    # RSI - karar bölgesi
+    rsi_show = rsi_full.loc[df.index]
+    fig.add_trace(go.Scatter(x=df.index, y=rsi_show, name="RSI",
+                  line=dict(color="#ff7043", width=1.3)), row=3, col=1)
+    fig.add_hline(y=70, line=dict(color="rgba(234,57,67,0.4)", dash="dash"), row=3, col=1)
+    fig.add_hline(y=30, line=dict(color="rgba(22,199,132,0.4)", dash="dash"), row=3, col=1)
+
     if df_future is not None and len(df_future):
+        # Sonuç bölgesi mumları (daha soluk renkle)
         fig.add_trace(go.Candlestick(x=df_future.index, open=df_future["Open"], high=df_future["High"],
-                      low=df_future["Low"], close=df_future["Close"], name="Sonuç",
-                      increasing_line_color="#80cbc4", decreasing_line_color="#ef9a9a"), row=1, col=1)
-        fig.add_vline(x=df_future.index[0], line=dict(color="yellow", width=2, dash="dash"))
+                      low=df_future["Low"], close=df_future["Close"], name="Sonuç Bölgesi",
+                      increasing_line_color="#80cbc4", decreasing_line_color="#ef9a9a",
+                      increasing_fillcolor="rgba(128,203,196,0.55)",
+                      decreasing_fillcolor="rgba(239,154,154,0.55)", line=dict(width=1)), row=1, col=1)
+        # Sonuç bölgesini sarı şeritle vurgula
+        fig.add_vrect(x0=df_future.index[0], x1=df_future.index[-1],
+                      fillcolor="rgba(255,235,59,0.06)", line_width=0, row=1, col=1)
+        fig.add_vline(x=df_future.index[0], line=dict(color="#ffeb3b", width=2, dash="dash"))
+        # Karar noktası etiketi
+        fig.add_annotation(x=df_future.index[0], y=1, yref="y domain",
+                           text="◀ Karar Anı", showarrow=False, font=dict(color="#ffeb3b", size=11),
+                           bgcolor="rgba(0,0,0,0.5)", xanchor="left", row=1, col=1)
+        # Sonuç bölgesi hacim ve RSI
+        vc = [C_UP if c >= o else C_DOWN for c, o in zip(df_future["Close"], df_future["Open"])]
+        fig.add_trace(go.Bar(x=df_future.index, y=df_future["Volume"], name="Sonuç Hacim",
+                      marker_color=vc, opacity=0.3, showlegend=False), row=2, col=1)
+        fig.add_trace(go.Scatter(x=df_future.index, y=rsi_full.loc[df_future.index], name="RSI Sonuç",
+                      line=dict(color="rgba(255,112,67,0.5)", width=1.3), showlegend=False), row=3, col=1)
+
     fig.update_layout(template="plotly_dark", paper_bgcolor="rgba(0,0,0,0)",
-                      plot_bgcolor="rgba(13,17,28,1)", height=520, xaxis_rangeslider_visible=False,
-                      legend=dict(orientation="h", y=1.02, x=1, xanchor="right"),
-                      margin=dict(l=10, r=10, t=50, b=10))
+                      plot_bgcolor="rgba(13,17,28,1)", height=640, xaxis_rangeslider_visible=False,
+                      legend=dict(orientation="h", y=1.04, x=1, xanchor="right", font=dict(size=11)),
+                      font=dict(family="Segoe UI, sans-serif", size=12),
+                      margin=dict(l=10, r=10, t=60, b=10), hovermode="x unified",
+                      bargap=0.15)
+    fig.update_yaxes(gridcolor="rgba(255,255,255,0.05)", zeroline=False)
+    fig.update_xaxes(gridcolor="rgba(255,255,255,0.04)", rangeslider_visible=False)
+    fig.update_yaxes(range=[0, 100], row=3, col=1)
     return fig
 
 
@@ -765,8 +1232,10 @@ def main():
         key_value = st.slider("Key Value (Hassasiyet)", 0.5, 5.0, 1.0, 0.1)
         atr_period = st.slider("ATR Period", 1, 30, 10, 1)
         st.divider()
-        st.subheader("Backtest")
-        initial_cash = st.number_input("Sermaye ($)", 100.0, 1_000_000.0, 10000.0, 100.0)
+        st.subheader("Hesap & Risk")
+        initial_cash = st.number_input("Hesap / Sermaye ($)", 100.0, 1_000_000.0, 10000.0, 100.0)
+        risk_pct = st.slider("İşlem Başına Risk (%)", 0.25, 5.0, 1.0, 0.25,
+                             help="Profesyoneller işlem başına hesabın %1-2'sini riske atar.")
         fee_pct = st.number_input("Komisyon (%)", 0.0, 1.0, 0.1, 0.01)
         st.divider()
         st.caption(f"Havuz: {len(tickers)} hisse")
@@ -775,11 +1244,11 @@ def main():
     tab1, tab2, tab3 = st.tabs(
         ["📡 Piyasa Tarayıcı", "🤖 Detaylı Analiz", "🎮 Simülasyon"])
     with tab1:
-        page_scanner(tickers, period, interval, key_value, atr_period)
+        page_scanner(tickers, period, interval, key_value, atr_period, initial_cash, risk_pct)
     with tab2:
-        page_analysis(tickers, period, interval, key_value, atr_period, initial_cash, fee_pct)
+        page_analysis(tickers, period, interval, key_value, atr_period, initial_cash, fee_pct, risk_pct)
     with tab3:
-        page_simulation(tickers, period, interval)
+        page_simulation(tickers, period, interval, initial_cash, risk_pct)
 
 
 if __name__ == "__main__":
