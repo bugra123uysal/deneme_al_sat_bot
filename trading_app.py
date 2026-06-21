@@ -705,8 +705,12 @@ def _scan_card(r, color, sub):
 
 
 def page_scanner(tickers, period, interval, key_value, atr_period, initial_cash=10000.0, risk_pct=1.0):
-    st.subheader("📡 Piyasa Tarayıcı")
-    st.caption("Tüm hisse havuzu UT Bot mantığıyla taranır. AL/SAT sinyali verenler ve eğilim adayları gruplanır.")
+    st.markdown(
+        '<div class="page-header">'
+        '<h2>📡 Sinyal Tarayıcı</h2>'
+        '<p>Havuzdaki her hisse UT Bot algoritmasıyla taranır. '
+        'AL/SAT sinyali üretenler ve yükseliş eğilimindeki adaylar ayrı gruplar halinde listelenir.</p>'
+        '</div>', unsafe_allow_html=True)
 
     lookback = st.slider("Sinyal Tazeliği (son kaç mumda sinyal aransın)", 1, 10, 3,
                          help="1 = sadece en son mumda sinyal verenler")
@@ -772,7 +776,12 @@ def page_scanner(tickers, period, interval, key_value, atr_period, initial_cash=
 
 
 def page_analysis(tickers, period, interval, key_value, atr_period, initial_cash, fee_pct, risk_pct=1.0):
-    st.subheader("🤖 Detaylı Hisse Analizi")
+    st.markdown(
+        '<div class="page-header">'
+        '<h2>🔬 Hisse Analizi</h2>'
+        '<p>Seçtiğin hisse için UT Bot grafiği, RSI, EMA şeridi ve backtest sonuçları birlikte gösterilir. '
+        'Ayrıca hesabına göre giriş noktası, stop-loss ve kâr hedefi içeren bir işlem planı oluşturulur.</p>'
+        '</div>', unsafe_allow_html=True)
     pool = tickers + (["BTC-USD", "ETH-USD"])
     sel = st.selectbox("Hisse Seç", pool, index=0)
     manual = st.text_input("veya manuel sembol gir (opsiyonel)", "")
@@ -998,9 +1007,13 @@ def scan_momentum(universe: list, min_rs: int, min_adr: float) -> pd.DataFrame:
 
 
 def page_momentum():
-    st.subheader("🚀 Momentum / Breakout Tarayıcı")
-    st.caption("Qullamaggie & Minervini tarzı: güçlü momentum (yüksek RS) + yüksek ADR% + "
-               "EMA bulutu üstünde sıkışma/kırılım. Tıpkı FCEL, ARM, FLNC tarzı kurulumlar.")
+    st.markdown(
+        '<div class="page-header">'
+        '<h2>🚀 Momentum & Kırılım Tarayıcı</h2>'
+        '<p>Qullamaggie ve Minervini\'nin kullandığı kriterleri uygular: güçlü göreli momentum (RS), '
+        'yüksek volatilite (ADR%) ve EMA bulutu üstünde sıkışma. '
+        'Kırılım öncesi birikim yapan hisseleri erken tespit etmek için kullanılır.</p>'
+        '</div>', unsafe_allow_html=True)
 
     c = st.columns(3)
     min_rs = c[0].slider("Min. RS Rating", 50, 99, 80, help="Göreli güç (havuz içi yüzdelik). IBD: 80+ ideal")
@@ -1132,7 +1145,12 @@ def _build_daily_summary(spx_chg, vix_chg, sec_df, wdf) -> str:
 
 
 def page_market_pulse(tickers):
-    st.subheader("🐋 Piyasa Nabzı — Makro, Sektör Rotasyonu & Para Akışı")
+    st.markdown(
+        '<div class="page-header">'
+        '<h2>🌍 Piyasa Nabzı</h2>'
+        '<p>S&amp;P500, VIX, faiz, dolar ve sektör ETF\'leri izlenir. '
+        'Genel piyasa Risk-On mu Risk-Off mu — önce bunu anla, sonra işlem yap.</p>'
+        '</div>', unsafe_allow_html=True)
     top = st.columns([3, 1])
     top[0].caption("Veri ~15 dk gecikmeli (Yahoo Finance). 'Yenile' ile güncelle veya cache 3 dk'da otomatik tazelenir.")
     if top[1].button("🔄 Yenile", use_container_width=True):
@@ -1269,7 +1287,12 @@ def page_simulation(tickers, period, interval, initial_cash=10000.0, risk_pct=1.
     init_sim_state()
     st.session_state["_sim_account"] = initial_cash
     st.session_state["_sim_risk"] = risk_pct
-    st.subheader("🎮 Trading Simülasyon Oyunu")
+    st.markdown(
+        '<div class="page-header">'
+        '<h2>🎮 Simülasyon</h2>'
+        '<p>Gerçek grafiklere bakarak al/sat kararı ver, anında sonucunu gör. '
+        'XP kazan, rozet topla ve disiplinini geliştir — gerçek para riske atmadan.</p>'
+        '</div>', unsafe_allow_html=True)
     st.caption("Grafiği analiz et, kararını ver, sonucu gör. $100 sanal bakiye ile başla.")
 
     bal = st.session_state["balance"]
@@ -1792,56 +1815,316 @@ def _sim_balance_chart():
 
 
 # ===========================================================================
+# BALİNA RADAR
+# ===========================================================================
+
+def _whale_score(df: pd.DataFrame) -> dict:
+    """RVOL, OBV eğimi, MFI ve fiyat-EMA konumuna göre balina birikim skoru hesaplar."""
+    if len(df) < 25:
+        return None
+
+    rvol = relative_volume(df, 20)
+    mfi_val = float(compute_mfi(df, 14).iloc[-1]) if not compute_mfi(df, 14).isna().iloc[-1] else 50.0
+    obv = compute_obv(df)
+    obv_slope = float(obv.iloc[-1] - obv.iloc[-6]) / (abs(obv.iloc[-6]) + 1)  # 5 günlük OBV eğimi
+
+    close = df["Close"]
+    ema50 = compute_ema(close, 50).iloc[-1]
+    price = float(close.iloc[-1])
+    above_ema50 = price > ema50
+
+    # Skor: 0-100
+    score = 0
+    score += min(rvol * 20, 35)          # maks 35 puan (RVOL)
+    score += min(max(mfi_val - 50, 0), 25)  # maks 25 puan (MFI > 50)
+    score += 20 if obv_slope > 0 else 0  # OBV yükseliyor mu?
+    score += 20 if above_ema50 else 0    # EMA50 üstünde mi?
+
+    sinyal = "🔴 Zayıf"
+    if score >= 70:
+        sinyal = "🟢 Güçlü Birikim"
+    elif score >= 45:
+        sinyal = "🟡 Orta Sinyal"
+
+    return {
+        "score": round(score, 1),
+        "rvol": round(rvol, 2),
+        "mfi": round(mfi_val, 1),
+        "obv_rising": obv_slope > 0,
+        "above_ema50": above_ema50,
+        "price": round(price, 2),
+        "sinyal": sinyal,
+    }
+
+
+@st.cache_data(ttl=300)
+def _fetch_whale_data(ticker: str) -> pd.DataFrame | None:
+    try:
+        df = yf.download(ticker, period="3mo", interval="1d", progress=False, auto_adjust=True)
+        if df is None or len(df) < 20:
+            return None
+        df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
+        return df
+    except Exception:
+        return None
+
+
+def page_whale_radar(tickers: list):
+    st.markdown(
+        '<div class="page-header">'
+        '<h2>🐋 Balina Radar</h2>'
+        '<p>Büyük kurumlar (hedge fund, yatırım bankaları) pozisyon alırken kasıtlı sessiz davranır — '
+        'ama izlerini hacimde bırakırlar. Bu sekme RVOL, OBV, MFI ve EMA50\'yi birleştirerek '
+        'hangi hissede sessiz birikim yapıldığını tespit eder.</p>'
+        '</div>', unsafe_allow_html=True)
+
+    universe_options = {
+        "Varsayılan Havuz": tickers,
+        "Momentum Evreni": MOMENTUM_UNIVERSE,
+        "Nasdaq-100": NASDAQ100,
+    }
+    col_a, col_b = st.columns([2, 1])
+    with col_a:
+        secim = st.selectbox("Taranacak Hisse Havuzu", list(universe_options.keys()))
+    with col_b:
+        min_score = st.slider("Minimum Skor", 0, 100, 40, 5)
+
+    scan_list = universe_options[secim]
+
+    if st.button("🔍 Balina Radar'ı Çalıştır", type="primary"):
+        results = []
+        prog = st.progress(0, text="Taranıyor...")
+        for i, ticker in enumerate(scan_list):
+            df = _fetch_whale_data(ticker)
+            if df is not None:
+                info = _whale_score(df)
+                if info and info["score"] >= min_score:
+                    info["ticker"] = ticker
+                    results.append(info)
+            prog.progress((i + 1) / len(scan_list), text=f"{ticker} taranıyor…")
+        prog.empty()
+
+        if not results:
+            st.warning("Seçilen kriterlerde sinyal bulunamadı. Minimum skoru düşürmeyi dene.")
+            return
+
+        results.sort(key=lambda x: x["score"], reverse=True)
+
+        st.markdown(f"### {len(results)} Hisse Bulundu")
+
+        # Özet metrikler
+        m1, m2, m3 = st.columns(3)
+        guclu = sum(1 for r in results if "Güçlü" in r["sinyal"])
+        orta = sum(1 for r in results if "Orta" in r["sinyal"])
+        m1.metric("🟢 Güçlü Birikim", guclu)
+        m2.metric("🟡 Orta Sinyal", orta)
+        m3.metric("Toplam Tarama", len(scan_list))
+
+        st.divider()
+
+        # Kart tabanlı gösterim
+        for r in results:
+            bg = "rgba(22,199,132,0.08)" if "Güçlü" in r["sinyal"] else "rgba(240,185,11,0.06)"
+            border = "#16c784" if "Güçlü" in r["sinyal"] else "#f0b90b"
+
+            st.markdown(
+                f"""<div style="background:{bg};border:1px solid {border};border-radius:12px;
+                padding:14px 18px;margin-bottom:10px;">
+                <b style="font-size:1.15rem;">{r['ticker']}</b>
+                &nbsp;&nbsp;<span style="font-size:1rem;">{r['sinyal']}</span>
+                &nbsp;&nbsp;<span style="color:#9ca3af;font-size:0.85rem;">Skor: {r['score']}/100</span>
+                <br>
+                <span style="font-size:0.88rem;color:#d1d5db;">
+                💲 Fiyat: <b>{r['price']}</b> &nbsp;|&nbsp;
+                📊 RVOL: <b>{r['rvol']}x</b> &nbsp;|&nbsp;
+                💧 MFI: <b>{r['mfi']}</b> &nbsp;|&nbsp;
+                📈 OBV: <b>{'↑ Yükseliyor' if r['obv_rising'] else '↓ Düşüyor'}</b> &nbsp;|&nbsp;
+                EMA50: <b>{'✅ Üstünde' if r['above_ema50'] else '❌ Altında'}</b>
+                </span>
+                </div>""",
+                unsafe_allow_html=True,
+            )
+
+        st.divider()
+
+        # Tablo görünümü
+        with st.expander("📋 Tablo Olarak Göster"):
+            table_data = [
+                {
+                    "Ticker": r["ticker"],
+                    "Sinyal": r["sinyal"],
+                    "Skor": r["score"],
+                    "Fiyat": r["price"],
+                    "RVOL": r["rvol"],
+                    "MFI": r["mfi"],
+                    "OBV": "↑" if r["obv_rising"] else "↓",
+                    "EMA50": "✅" if r["above_ema50"] else "❌",
+                }
+                for r in results
+            ]
+            st.dataframe(pd.DataFrame(table_data), use_container_width=True, hide_index=True)
+
+    else:
+        st.info("Yukarıdaki butona basarak taramayı başlat. Havuzdaki her hisse için RVOL, OBV, MFI ve EMA50 analizi yapılır.")
+
+        st.markdown("""
+        #### Nasıl Çalışır?
+
+        | İndikatör | Anlam | Güçlü Sinyal |
+        |-----------|-------|-------------|
+        | **RVOL** | Bugünkü hacim / 20 günlük ortalama | > 1.5x |
+        | **MFI** | Para Akış İndeksi (hacim ağırlıklı RSI) | > 50 ve yükseliyor |
+        | **OBV** | Birikim/Dağıtım hacim eğrisi | Fiyattan bağımsız yükseliyor |
+        | **EMA50** | Orta vadeli trend filtresi | Fiyat EMA50 üstünde |
+
+        **Skor sistemi:**
+        - 🟢 70-100 → Güçlü Birikim (kurumsal alım ihtimali yüksek)
+        - 🟡 45-69 → Orta Sinyal (takipte tut)
+        - 🔴 0-44 → Zayıf (atla)
+        """)
+
+
+# ===========================================================================
 # ANA UYGULAMA
 # ===========================================================================
 
 def main():
-    st.set_page_config(page_title="ABD Al/Sat Botu", page_icon="📈", layout="wide")
+    st.set_page_config(page_title="ABD Borsa Botu", page_icon="📈", layout="wide")
 
     st.markdown("""
     <style>
-    .mcard {background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.08);
-            border-radius:12px;padding:10px;text-align:center;}
-    .mval {font-size:1.3rem;font-weight:700;color:#3b82f6;}
-    .mlbl {font-size:0.72rem;color:#9ca3af;}
-    .badge {display:inline-block;background:rgba(240,185,11,0.15);border:1px solid #f0b90b;
-            border-radius:20px;padding:3px 10px;margin:3px;font-size:0.8rem;}
-    .stTabs [data-baseweb="tab-list"] {gap:8px;}
-    .stTabs [data-baseweb="tab"] {border-radius:8px 8px 0 0;padding:8px 18px;}
+    /* ── Genel arka plan ── */
+    .stApp { background: #0b0f1a; }
+
+    /* ── Sekme çubuğu ── */
+    .stTabs [data-baseweb="tab-list"] {
+        gap: 4px;
+        background: #111827;
+        border-radius: 12px;
+        padding: 5px;
+        border: 1px solid rgba(255,255,255,0.07);
+    }
+    .stTabs [data-baseweb="tab"] {
+        border-radius: 8px;
+        padding: 8px 16px;
+        font-size: 0.85rem;
+        font-weight: 500;
+        color: #9ca3af;
+        background: transparent;
+        border: none;
+        transition: all 0.2s;
+    }
+    .stTabs [aria-selected="true"] {
+        background: #1e293b !important;
+        color: #f1f5f9 !important;
+        border: 1px solid rgba(255,255,255,0.1) !important;
+    }
+    .stTabs [data-baseweb="tab-highlight"] { display: none; }
+    .stTabs [data-baseweb="tab-border"] { display: none; }
+
+    /* ── Kart bileşeni ── */
+    .mcard {
+        background: rgba(255,255,255,0.03);
+        border: 1px solid rgba(255,255,255,0.07);
+        border-radius: 12px;
+        padding: 14px;
+        text-align: center;
+    }
+    .mval { font-size: 1.25rem; font-weight: 700; color: #3b82f6; }
+    .mlbl { font-size: 0.72rem; color: #6b7280; margin-top: 2px; }
+
+    /* ── Rozet ── */
+    .badge {
+        display: inline-block;
+        background: rgba(240,185,11,0.12);
+        border: 1px solid rgba(240,185,11,0.4);
+        border-radius: 20px;
+        padding: 3px 10px;
+        margin: 3px;
+        font-size: 0.78rem;
+        color: #f0b90b;
+    }
+
+    /* ── Sayfa başlık bloğu ── */
+    .page-header {
+        background: rgba(255,255,255,0.02);
+        border: 1px solid rgba(255,255,255,0.07);
+        border-radius: 14px;
+        padding: 20px 24px;
+        margin-bottom: 20px;
+    }
+    .page-header h2 { margin: 0 0 4px 0; font-size: 1.3rem; color: #f1f5f9; }
+    .page-header p  { margin: 0; font-size: 0.85rem; color: #6b7280; }
+
+    /* ── Uyarı bandı ── */
+    .warn-bar {
+        background: rgba(234,57,67,0.08);
+        border-left: 3px solid #ea3943;
+        border-radius: 6px;
+        padding: 8px 14px;
+        font-size: 0.78rem;
+        color: #9ca3af;
+        margin-bottom: 16px;
+    }
+
+    /* ── Sidebar ── */
+    section[data-testid="stSidebar"] { background: #0f172a; }
+    section[data-testid="stSidebar"] .stSelectbox label,
+    section[data-testid="stSidebar"] .stSlider label,
+    section[data-testid="stSidebar"] .stNumberInput label { font-size: 0.82rem; color: #9ca3af; }
     </style>
     """, unsafe_allow_html=True)
 
+    # Uyarı bandı
     st.markdown(
-        '<div style="background:rgba(234,57,67,0.1);border-left:3px solid #ea3943;'
-        'padding:8px 12px;border-radius:6px;font-size:0.8rem;color:#bbb;margin-bottom:12px;">'
-        '⚠️ Yatırım tavsiyesi değildir. Gerçek emir göndermez. Eğitim ve simülasyon amaçlıdır.</div>',
+        '<div class="warn-bar">⚠️ Bu araç yalnızca eğitim amaçlıdır. '
+        'Gerçek emir göndermez ve yatırım tavsiyesi niteliği taşımaz.</div>',
         unsafe_allow_html=True)
 
-    st.title("📈 ABD Borsası Al/Sat Botu")
+    # Başlık
+    st.markdown(
+        '<h1 style="font-size:1.8rem;font-weight:800;color:#f1f5f9;margin-bottom:4px;">📈 ABD Borsa Botu</h1>'
+        '<p style="color:#6b7280;font-size:0.88rem;margin-bottom:20px;">'
+        'UT Bot · Momentum · Kurumsal Para Akışı · Backtest · Simülasyon</p>',
+        unsafe_allow_html=True)
 
+    # ── Sidebar ──
     with st.sidebar:
-        st.title("⚙️ Ayarlar")
-        custom = st.text_input("Özel Ticker Listesi (virgülle)", "")
+        st.markdown('<p style="font-size:1rem;font-weight:700;color:#f1f5f9;margin-bottom:4px;">⚙️ Ayarlar</p>', unsafe_allow_html=True)
+        custom = st.text_input("Özel hisse listesi (virgülle ayır)", "", placeholder="AAPL, MSFT, NVDA")
         tickers = [t.strip().upper() for t in custom.split(",") if t.strip()] or list(DEFAULT_TICKERS)
-        period_label = st.selectbox("Zaman Aralığı", list(PERIOD_INTERVAL_MAP.keys()), index=2)
+        period_label = st.selectbox("Zaman aralığı", list(PERIOD_INTERVAL_MAP.keys()), index=2)
         period, interval = PERIOD_INTERVAL_MAP[period_label]
-        st.divider()
-        st.subheader("UT Bot Parametreleri")
-        key_value = st.slider("Key Value (Hassasiyet)", 0.5, 5.0, 1.0, 0.1)
-        atr_period = st.slider("ATR Period", 1, 30, 10, 1)
-        st.divider()
-        st.subheader("Hesap & Risk")
-        initial_cash = st.number_input("Hesap / Sermaye ($)", 100.0, 1_000_000.0, 10000.0, 100.0)
-        risk_pct = st.slider("İşlem Başına Risk (%)", 0.25, 5.0, 1.0, 0.25,
-                             help="Profesyoneller işlem başına hesabın %1-2'sini riske atar.")
-        fee_pct = st.number_input("Komisyon (%)", 0.0, 1.0, 0.1, 0.01)
-        st.divider()
-        st.caption(f"Havuz: {len(tickers)} hisse")
-        st.caption(", ".join(tickers[:8]) + ("..." if len(tickers) > 8 else ""))
 
-    tab1, tab2, tab3, tab4, tab5 = st.tabs(
-        ["📡 Piyasa Tarayıcı", "🚀 Momentum/Breakout", "🐋 Piyasa Nabzı",
-         "🤖 Detaylı Analiz", "🎮 Simülasyon"])
+        st.divider()
+        st.markdown('<p style="font-size:0.8rem;font-weight:600;color:#9ca3af;">UT BOT</p>', unsafe_allow_html=True)
+        key_value = st.slider("Hassasiyet (Key Value)", 0.5, 5.0, 1.0, 0.1,
+                              help="Düşük = daha fazla sinyal, yüksek = daha az ama güçlü sinyal")
+        atr_period = st.slider("ATR Periyodu", 1, 30, 10, 1,
+                               help="Volatilite hesaplama penceresi. Varsayılan 10 önerilir.")
+
+        st.divider()
+        st.markdown('<p style="font-size:0.8rem;font-weight:600;color:#9ca3af;">HESAP & RİSK</p>', unsafe_allow_html=True)
+        initial_cash = st.number_input("Sermaye ($)", 100.0, 1_000_000.0, 10000.0, 100.0)
+        risk_pct = st.slider("İşlem başına risk (%)", 0.25, 5.0, 1.0, 0.25,
+                             help="Profesyoneller işlem başına hesabın %1–2'sini riske atar.")
+        fee_pct = st.number_input("Komisyon (%)", 0.0, 1.0, 0.1, 0.01)
+
+        st.divider()
+        st.markdown(
+            f'<p style="font-size:0.78rem;color:#4b5563;">Aktif havuz: <b style="color:#9ca3af;">{len(tickers)} hisse</b></p>'
+            f'<p style="font-size:0.75rem;color:#374151;">{", ".join(tickers[:8])}{"…" if len(tickers) > 8 else ""}</p>',
+            unsafe_allow_html=True)
+
+    # ── Sekmeler ──
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+        "📡  Sinyal Tarayıcı",
+        "🚀  Momentum & Kırılım",
+        "🌍  Piyasa Nabzı",
+        "🔬  Hisse Analizi",
+        "🎮  Simülasyon",
+        "🐋  Balina Radar",
+    ])
     with tab1:
         page_scanner(tickers, period, interval, key_value, atr_period, initial_cash, risk_pct)
     with tab2:
@@ -1852,6 +2135,8 @@ def main():
         page_analysis(tickers, period, interval, key_value, atr_period, initial_cash, fee_pct, risk_pct)
     with tab5:
         page_simulation(tickers, period, interval, initial_cash, risk_pct)
+    with tab6:
+        page_whale_radar(tickers)
 
 
 if __name__ == "__main__":
