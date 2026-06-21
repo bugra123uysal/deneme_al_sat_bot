@@ -154,7 +154,8 @@ MIT License — istediğin gibi kullanabilir, değiştirebilir ve dağıtabilirs
 <p align="center">
   Geliştiren: <a href="https://github.com/bugra123uysal">bugra123uysal</a> &nbsp;·&nbsp;
   Katkıda bulunmak için <a href="https://github.com/bugra123uysal/deneme_al_sat_bot/fork">Fork'la
-  linkedin: <a href="https://www.linkedin.com/in/mesut-bu%C4%9Fra-uysal-16a1bb288/">
+
   </a>
 
 </p>
+  linkedin: <a href="https://www.linkedin.com/in/mesut-bu%C4%9Fra-uysal-16a1bb288/">
